@@ -699,24 +699,28 @@ _DISPATCH = {
 }
 
 
-@mcp.tool()
-def apply_keyword_mutation(
-    code: str,
-    client_root: str | None = None,
-) -> dict[str, Any]:
-  """Applies a previously proposed keyword mutation.
+def register_executor(op: str, executor) -> None:
+  """Registers an executor for a new gated operation type.
 
-  Reads pending_approvals/<code>.md, verifies its hash, executes the
-  Google Ads API call, appends an audit row, and archives the pending
-  file to applied_approvals/.
+  Lets sibling modules add capabilities (bidding, assets) that flow
+  through this exact same propose -> approve -> apply -> audit path,
+  rather than standing up a second, weaker gate beside it.
 
   Args:
-      code: The 6-char code from a propose_* tool's output (e.g.,
-          'A7K2P3'). User normally provides this by saying
-          'approve A7K2P3'.
-      client_root: Per-client folder. Falls back to env
-          LO_AGENCY_CLIENT_ROOT.
+      op: The `spec["op"]` discriminator written by the propose tool.
+      executor: Callable (ads_client, customer_id, spec) -> dict.
+
+  Raises:
+      ValueError: If `op` is already registered. Silent replacement would
+          let one module hijack another's approved proposals.
   """
+  if op in _DISPATCH:
+    raise ValueError(f"Executor for op {op!r} is already registered.")
+  _DISPATCH[op] = executor
+
+
+def _apply_proposal(code: str, client_root: str | None) -> dict[str, Any]:
+  """Shared body for the apply tools. See apply_mutation for behavior."""
   root = audit.resolve_client_root(client_root)
   proposal = approval.read_proposal(root, code)
   tool_name = proposal["tool"]
@@ -777,6 +781,47 @@ def apply_keyword_mutation(
       "archived_to": str(archived_path),
       "api_result": api_result,
   }
+
+
+@mcp.tool()
+def apply_mutation(
+    code: str,
+    client_root: str | None = None,
+) -> dict[str, Any]:
+  """Applies any previously proposed and approved mutation.
+
+  Reads pending_approvals/<code>.md, verifies its hash, executes the
+  Google Ads API call, appends an audit row, and archives the pending
+  file to applied_approvals/. Handles every registered operation type,
+  including bidding and asset operations.
+
+  Args:
+      code: The 6-char code from a propose_* tool's output (e.g.,
+          'A7K2P3'). User normally provides this by saying
+          'approve A7K2P3'.
+      client_root: Per-client folder. Falls back to env
+          LO_AGENCY_CLIENT_ROOT.
+  """
+  return _apply_proposal(code, client_root)
+
+
+@mcp.tool()
+def apply_keyword_mutation(
+    code: str,
+    client_root: str | None = None,
+) -> dict[str, Any]:
+  """Applies a previously proposed keyword mutation.
+
+  Retained for continuity with existing runbooks. Identical to
+  apply_mutation, which is the preferred name now that the gate also
+  covers bidding and asset operations.
+
+  Args:
+      code: The 6-char code from a propose_* tool's output.
+      client_root: Per-client folder. Falls back to env
+          LO_AGENCY_CLIENT_ROOT.
+  """
+  return _apply_proposal(code, client_root)
 
 
 @mcp.tool()

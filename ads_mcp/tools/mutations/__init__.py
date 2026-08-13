@@ -20,6 +20,7 @@ from ads_mcp.tools.mutations import budget
 from ads_mcp.tools.mutations import campaign
 from ads_mcp.tools.mutations import common
 from ads_mcp.tools.mutations import criterion
+from ads_mcp.tools.mutations import policy
 
 __all__ = [
     "ad",
@@ -28,4 +29,5 @@ __all__ = [
     "campaign",
     "common",
     "criterion",
+    "policy",
 ]

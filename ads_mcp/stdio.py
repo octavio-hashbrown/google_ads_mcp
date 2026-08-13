@@ -22,6 +22,7 @@ from ads_mcp.coordinator import mcp_server
 from ads_mcp.scripts.generate_views import update_views_yaml
 from ads_mcp.tools import accounts
 from ads_mcp.tools import docs
+from ads_mcp.tools import planning
 from ads_mcp.tools import reporting
 from ads_mcp.tools._utils import get_ads_client
 import dotenv
@@ -29,11 +30,15 @@ import dotenv
 dotenv.load_dotenv()
 
 
-tools = [reporting, accounts, docs]
+# planning is read-only (Keyword Planner ideas), so it loads unconditionally
+# alongside the other read tools.
+tools = [reporting, accounts, docs, planning]
 
 if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
   from ads_mcp.tools import mutations  # pylint: disable=ungrouped-imports
   from ads_mcp.tools import (  # pylint: disable=ungrouped-imports
+      gated_assets,
+      gated_bidding,
       mutations_gated,
   )
 
@@ -45,6 +50,8 @@ if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
           mutations.ad,
           mutations.criterion,
           mutations_gated,
+          gated_bidding,
+          gated_assets,
       ]
   )
 
