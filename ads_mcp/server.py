@@ -40,6 +40,7 @@ if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
   from ads_mcp.tools import (  # pylint: disable=ungrouped-imports
       gated_assets,
       gated_bidding,
+      gated_conversions,
       mutations_gated,
   )
 
@@ -53,6 +54,7 @@ if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
           mutations_gated,
           gated_bidding,
           gated_assets,
+          gated_conversions,
       ]
   )
 
