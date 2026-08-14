@@ -40,6 +40,7 @@ if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
       gated_assets,
       gated_bidding,
       gated_conversions,
+      gated_migration,
       mutations_gated,
   )
 
@@ -54,6 +55,7 @@ if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
           gated_bidding,
           gated_assets,
           gated_conversions,
+          gated_migration,
       ]
   )
 
