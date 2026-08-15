@@ -38,6 +38,7 @@ tools = [reporting, accounts, docs, planning]
 if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
   from ads_mcp.tools import mutations  # pylint: disable=ungrouped-imports
   from ads_mcp.tools import (  # pylint: disable=ungrouped-imports
+      gated_ad_copy,
       gated_assets,
       gated_bidding,
       gated_conversions,
@@ -57,6 +58,7 @@ if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
           gated_assets,
           gated_conversions,
           gated_migration,
+          gated_ad_copy,
       ]
   )
 
