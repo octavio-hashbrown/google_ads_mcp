@@ -77,6 +77,21 @@ _ALLOWED_OPERATION_KINDS = frozenset({
     "ad_group_criterion_operation",
 })
 
+# The exact update masks each operation kind may carry. Enforcing these
+# makes whole categories of change structurally unreachable rather than
+# merely unused: a campaign_operation may only ever name "status", so this
+# tooling cannot alter a bidding strategy, a budget link or a network
+# setting even if a spec were hand-edited to try.
+_ALLOWED_UPDATE_MASKS: dict[str, tuple[frozenset[str], ...]] = {
+    "ad_group_operation": (
+        frozenset({"cpc_bid_micros"}),
+        frozenset({"status"}),
+    ),
+    "campaign_budget_operation": (frozenset({"amount_micros"}),),
+    "campaign_operation": (frozenset({"status"}),),
+    "ad_group_criterion_operation": (frozenset({"status"}),),
+}
+
 
 def protected_campaign_ids(explicit: list[str] | None = None) -> set[str]:
   """Campaign IDs this tooling refuses to touch.
@@ -275,12 +290,16 @@ def assert_operations_within_scope(
 
     if kind == "ad_group_operation":
       target = mo.ad_group_operation.update.resource_name
+      mask = set(mo.ad_group_operation.update_mask.paths)
     elif kind == "campaign_budget_operation":
       target = mo.campaign_budget_operation.update.resource_name
+      mask = set(mo.campaign_budget_operation.update_mask.paths)
     elif kind == "campaign_operation":
       target = mo.campaign_operation.update.resource_name
+      mask = set(mo.campaign_operation.update_mask.paths)
     elif kind == "ad_group_criterion_operation":
       target = mo.ad_group_criterion_operation.update.resource_name
+      mask = set(mo.ad_group_criterion_operation.update_mask.paths)
     else:  # campaign_criterion_operation — a create, keyed by its campaign
       create = mo.campaign_criterion_operation.create
       if not create.language.language_constant:
@@ -290,6 +309,17 @@ def assert_operations_within_scope(
             "negatives, devices or ad schedules."
         )
       target = create.campaign
+      mask = None
+
+    if mask is not None:
+      permitted = _ALLOWED_UPDATE_MASKS[kind]
+      if mask not in [set(m) for m in permitted]:
+        allowed = " or ".join(sorted(sorted(m)[0] for m in permitted))
+        raise ToolError(
+            f"Operation {i} ({kind}) carries update mask {sorted(mask)}, "
+            f"but this tooling may only write {allowed} on that resource. "
+            "Refusing the whole package."
+        )
 
     if target not in allowed_resource_names:
       raise ToolError(
@@ -561,6 +591,32 @@ def assert_no_drift(ads_client, customer_id: str, spec: dict[str, Any]) -> None:
         "Master tCPA (maximize_conversions.target_cpa_micros) is "
         f"{_usd(master['tcpa_micros'])}, expected "
         f"{_usd(guard['expect_tcpa_micros'])}."
+    )
+
+  # The migration campaign's own bidding strategy is guarded explicitly,
+  # not inferred from the presence of ad-group CPCs. Enabling a campaign
+  # whose strategy silently moved off Manual CPC would hand the approved
+  # bids to an algorithm the human never approved.
+  target_guard = spec.get("guard_target_campaign")
+  if not target_guard:
+    raise ToolError(
+        "This proposal predates the target-campaign bidding guard and "
+        "cannot be applied. Re-propose it with the current tool so the "
+        "bidding strategy is recorded and re-checked at apply time."
+    )
+  target = read_campaign_state(
+      ads_client, customer_id, target_guard["resource_name"]
+  )
+  if (
+      target["bidding_strategy_type"]
+      != target_guard["expect_bidding_strategy_type"]
+  ):
+    problems.append(
+        f"Campaign \"{target['name']}\" bidding strategy is "
+        f"{target['bidding_strategy_type']}, but the approval recorded "
+        f"{target_guard['expect_bidding_strategy_type']}. The approved "
+        "ad-group CPCs only govern under "
+        f"{target_guard['expect_bidding_strategy_type']}."
     )
 
   for upd in spec["budget_updates"]:
@@ -1082,6 +1138,8 @@ def propose_campaign_migration(
     reason_code: str,
     guard_master_campaign_id: str,
     guard_master_tcpa_usd: float,
+    guard_target_campaign_id: str,
+    guard_target_bidding_strategy_type: str,
     require_primary_conversion_action_ids: list[str],
     rule4_campaign_ids: list[str],
     ad_group_cpc_updates: list[dict] | None = None,
@@ -1114,6 +1172,14 @@ def propose_campaign_migration(
           strategy and tCPA must be unchanged at apply time.
       guard_master_tcpa_usd: The tCPA that must still be in force, read
           from maximize_conversions.target_cpa_micros.
+      guard_target_campaign_id: The campaign this migration activates. Its
+          bidding strategy is recorded and re-checked before apply.
+      guard_target_bidding_strategy_type: The bidding strategy that
+          campaign must be on at BOTH propose time and apply time, e.g.
+          MANUAL_CPC. Refuses immediately if it does not already match.
+          This is never inferred from ad-group CPCs, and the migration
+          cannot change it: campaign operations are mask-restricted to
+          "status".
       require_primary_conversion_action_ids: Conversion actions that must
           still be Primary and ENABLED at apply time.
       rule4_campaign_ids: Campaigns whose negative-vs-positive conflict
@@ -1171,6 +1237,19 @@ def propose_campaign_migration(
         "wrong."
     )
 
+  target_rn = campaign_rn(guard_target_campaign_id)
+  target_state = read_campaign_state(ads_client, customer_id, target_rn)
+  expect_strategy = str(guard_target_bidding_strategy_type).upper()
+  if target_state["bidding_strategy_type"] != expect_strategy:
+    raise ToolError(
+        f"Target campaign bidding guard mismatch at propose time: "
+        f"\"{target_state['name']}\" is on "
+        f"{target_state['bidding_strategy_type']}, you specified "
+        f"{expect_strategy}. Refusing to record a guard that is already "
+        "wrong. The approved ad-group CPCs only govern under "
+        f"{expect_strategy}."
+    )
+
   spec: dict[str, Any] = {
       "op": OP,
       "migration_label": migration_label,
@@ -1186,6 +1265,12 @@ def propose_campaign_migration(
           "expect_status": master["status"],
           "expect_bidding_strategy_type": master["bidding_strategy_type"],
           "expect_tcpa_micros": expect_tcpa,
+      },
+      "guard_target_campaign": {
+          "resource_name": target_rn,
+          "label": target_state["name"],
+          "expect_bidding_strategy_type": expect_strategy,
+          "observed_status": target_state["status"],
       },
       "guard_no_selective_optimization": [],
       "require_primary_conversion_action_ids": [
@@ -1318,6 +1403,11 @@ def propose_campaign_migration(
   human_lines.append(
       f"    Master \"{master['name']}\" must still be {master['status']} / "
       f"{master['bidding_strategy_type']} / tCPA {_usd(expect_tcpa)}"
+  )
+  human_lines.append(
+      f"    \"{target_state['name']}\" must still be on {expect_strategy} "
+      "(explicit hard guard, not inferred from ad-group CPCs; this "
+      "package cannot change a bidding strategy)"
   )
   human_lines.append(
       "    Every BEFORE value above must still match the live account"

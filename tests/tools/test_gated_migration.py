@@ -268,6 +268,12 @@ def _spec(**overrides):
           "expect_bidding_strategy_type": "MAXIMIZE_CONVERSIONS",
           "expect_tcpa_micros": 70_000_000,
       },
+      "guard_target_campaign": {
+          "resource_name": CAMP_BRAND,
+          "label": "Brand",
+          "expect_bidding_strategy_type": "MANUAL_CPC",
+          "observed_status": "PAUSED",
+      },
       "guard_no_selective_optimization": [CAMP_MASTER, CAMP_BRAND],
       "require_primary_conversion_action_ids": ["7521040525", "7385858877"],
       "rule4_campaign_resource_names": [CAMP_BRAND],
@@ -633,6 +639,133 @@ def test_refuses_when_selective_optimization_appears():
   client, _ = _client(s)
   with pytest.raises(ToolError, match="selective optimization"):
     gm.assert_no_drift(client, CID, _spec())
+
+
+def test_refuses_when_target_campaign_bidding_strategy_drifted():
+  """Brand moving off Manual CPC must block, not be inferred away.
+
+  The four approved ad-group CPCs only govern under Manual CPC. If the
+  campaign has been switched to a Smart Bidding strategy since approval,
+  enabling it would hand the traffic to an algorithm nobody approved.
+  """
+  s = _state()
+  s["campaigns"][CAMP_BRAND]["strategy"] = "MAXIMIZE_CONVERSIONS"
+  client, _ = _client(s)
+  with pytest.raises(ToolError, match="bidding strategy is MAXIMIZE_CONVERSIONS"):
+    gm.assert_no_drift(client, CID, _spec())
+
+
+def test_target_bidding_guard_is_independent_of_master_guard():
+  """Master unchanged, Brand drifted — must still refuse."""
+  s = _state()
+  s["campaigns"][CAMP_BRAND]["strategy"] = "TARGET_SPEND"
+  client, _ = _client(s)
+  with pytest.raises(ToolError) as excinfo:
+    gm.assert_no_drift(client, CID, _spec())
+  message = str(excinfo.value)
+  assert "Master campaign status" not in message
+  assert "TARGET_SPEND" in message
+
+
+def test_refuses_a_spec_that_predates_the_target_bidding_guard():
+  """An older spec has no guard to check, so it must not be applicable."""
+  client, _ = _client(_state())
+  spec = _spec()
+  del spec["guard_target_campaign"]
+  with pytest.raises(ToolError, match="predates the target-campaign bidding"):
+    gm.assert_no_drift(client, CID, spec)
+
+
+def test_executor_refuses_before_mutating_on_target_bidding_drift():
+  s = _state()
+  s["campaigns"][CAMP_BRAND]["strategy"] = "MAXIMIZE_CONVERSIONS"
+  client, service = _client(s)
+  service.mutate = mock.Mock()
+  with pytest.raises(ToolError, match="MIGRATION REFUSED"):
+    gm._execute_campaign_migration(client, CID, _spec())
+  service.mutate.assert_not_called()
+
+
+# -----------------------------------------------------------------------------
+# Update-mask enforcement — the migration cannot change a bidding strategy
+# -----------------------------------------------------------------------------
+
+
+def test_scope_check_refuses_a_campaign_operation_touching_bidding():
+  """A hand-built op that changes bidding must be refused structurally."""
+  from ads_mcp.tools._ads_api import resource_types, service_types
+  from google.protobuf import field_mask_pb2
+
+  campaign = resource_types.Campaign(resource_name=CAMP_BRAND)
+  campaign.manual_cpc.enhanced_cpc_enabled = True
+  inner = service_types.CampaignOperation(update=campaign)
+  inner.update_mask.CopyFrom(
+      field_mask_pb2.FieldMask(paths=["manual_cpc.enhanced_cpc_enabled"])
+  )
+  op = service_types.MutateOperation(campaign_operation=inner)
+  with pytest.raises(ToolError, match="may only write status"):
+    gm.assert_operations_within_scope([op], {CAMP_BRAND}, set())
+
+
+def test_scope_check_refuses_a_campaign_operation_touching_the_budget_link():
+  from ads_mcp.tools._ads_api import resource_types, service_types
+  from google.protobuf import field_mask_pb2
+
+  campaign = resource_types.Campaign(
+      resource_name=CAMP_BRAND, campaign_budget=BUDGET_MASTER
+  )
+  inner = service_types.CampaignOperation(update=campaign)
+  inner.update_mask.CopyFrom(
+      field_mask_pb2.FieldMask(paths=["campaign_budget"])
+  )
+  op = service_types.MutateOperation(campaign_operation=inner)
+  with pytest.raises(ToolError, match="may only write status"):
+    gm.assert_operations_within_scope([op], {CAMP_BRAND}, set())
+
+
+def test_scope_check_refuses_an_ad_group_operation_with_an_unexpected_mask():
+  from ads_mcp.tools._ads_api import resource_types, service_types
+  from google.protobuf import field_mask_pb2
+
+  ad_group = resource_types.AdGroup(resource_name=AG_CORE, name="renamed")
+  inner = service_types.AdGroupOperation(update=ad_group)
+  inner.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["name"]))
+  op = service_types.MutateOperation(ad_group_operation=inner)
+  with pytest.raises(ToolError, match="update mask"):
+    gm.assert_operations_within_scope([op], {AG_CORE}, set())
+
+
+def test_scope_check_refuses_a_budget_operation_with_an_unexpected_mask():
+  from ads_mcp.tools._ads_api import resource_types, service_types
+  from google.protobuf import field_mask_pb2
+
+  budget = resource_types.CampaignBudget(
+      resource_name=BUDGET_MASTER, explicitly_shared=True
+  )
+  inner = service_types.CampaignBudgetOperation(update=budget)
+  inner.update_mask.CopyFrom(
+      field_mask_pb2.FieldMask(paths=["explicitly_shared"])
+  )
+  op = service_types.MutateOperation(campaign_budget_operation=inner)
+  with pytest.raises(ToolError, match="may only write amount_micros"):
+    gm.assert_operations_within_scope([op], {BUDGET_MASTER}, set())
+
+
+def test_every_builder_output_passes_its_own_mask_check():
+  """The real builders must never trip the mask enforcement."""
+  ops = [
+      gm.build_ad_group_cpc_operation(AG_CORE, 6_500_000),
+      gm.build_ad_group_status_operation(AG_SOURCE, "PAUSED"),
+      gm.build_campaign_budget_amount_operation(BUDGET_MASTER, 115_000_000),
+      gm.build_campaign_status_operation(CAMP_BRAND, "ENABLED"),
+      gm.build_ad_group_criterion_status_operation(CRIT_A, "PAUSED"),
+      gm.build_campaign_language_operation(
+          CAMP_BRAND, "languageConstants/1000"
+      ),
+  ]
+  gm.assert_operations_within_scope(
+      ops, {AG_CORE, AG_SOURCE, BUDGET_MASTER, CAMP_BRAND, CRIT_A}, set()
+  )
 
 
 def test_refuses_when_rule4_conflicts_exist():
