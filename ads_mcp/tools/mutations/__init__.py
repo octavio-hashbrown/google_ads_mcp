@@ -36,9 +36,12 @@ Only `common` and `policy` are imported here. Both are pure helpers and
 register no tools -- verified by test, not by assumption
 (`tests/test_raw_mutation_gate.py::test_helper_modules_register_no_tools`).
 
-The five tool modules are imported explicitly, and only when
-`ADS_MCP_ENABLE_MUTATIONS=true` AND `ADS_MCP_ENABLE_RAW_MUTATIONS=true`, by
-`ads_mcp/stdio.py` and `ads_mcp/server.py`. See `ads_mcp/governance/flags.py`.
+The five tool modules are imported -- and therefore registered -- in exactly
+one place: `ads_mcp/tools/loader.py`, and only when
+`ADS_MCP_ENABLE_MUTATIONS=true` AND `ADS_MCP_ENABLE_RAW_MUTATIONS=true`.
+`loader.load_tools()` is called by both entrypoints, `ads_mcp/stdio.py` and
+`ads_mcp/server.py`, so neither transport carries its own copy of the gate.
+See `ads_mcp/governance/flags.py` for the flag semantics.
 """
 
 from ads_mcp.tools.mutations import common
