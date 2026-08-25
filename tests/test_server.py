@@ -55,40 +55,66 @@ def test_main_no_env(mock_update_views, mock_get_ads_client, mock_mcp_server):
   mock_get_ads_client.assert_called_once()
 
 
-def test_mutations_disabled_by_default():
-  """Tests that mutations are disabled by default."""
-  # Clear module from sys.modules to force reload and re-evaluate env var
+def _reload_server(env: dict[str, str], *, clear: bool):
+  """Re-imports server.py under a given environment and returns the module.
+
+  Tool registration happens at import time, so the module must be evicted
+  from sys.modules for the flag posture to be re-evaluated.
+  """
   if "ads_mcp.server" in sys.modules:
     del sys.modules["ads_mcp.server"]
 
-  with mock.patch.dict(os.environ, {}, clear=True):
-    # We need to mock get_ads_client and update_views_yaml to avoid actual calls
+  with mock.patch.dict(os.environ, env, clear=clear):
     with (
-        mock.patch("ads_mcp.server.get_ads_client"),
-        mock.patch("ads_mcp.server.update_views_yaml"),
-        mock.patch("ads_mcp.server.mcp_server"),
+        mock.patch("ads_mcp.tools._utils.get_ads_client"),
+        mock.patch("ads_mcp.scripts.generate_views.update_views_yaml"),
     ):
       import ads_mcp.server as server_module  # pylint: disable=import-outside-toplevel, reimported
 
-      # Verify that mutation modules are NOT in tools
-      tool_names = [t.__name__ for t in server_module.tools]
-      assert "ads_mcp.tools.mutations.budget" not in tool_names
-      assert "ads_mcp.tools.mutations.campaign" not in tool_names
+      return server_module
+
+
+def test_mutations_disabled_by_default():
+  """With no flags set, neither governed nor raw tiers load.
+
+  Asserts on `loaded_tiers`, the loader's actual return value. The previous
+  version of this test asserted on a `tools` list that was assigned but
+  never consumed, so it passed while all twelve raw tools were in fact being
+  registered by an import side effect. End-to-end registration is covered in
+  tests/test_raw_mutation_gate.py.
+  """
+  server_module = _reload_server({}, clear=True)
+
+  assert server_module.loaded_tiers["raw"] == []
+  assert server_module.loaded_tiers["governed"] == []
+  assert server_module.loaded_tiers["validate"] == []
+  assert server_module.loaded_tiers["read"]
 
 
 def test_mutations_enabled():
-  """Tests that mutations are enabled when env var is true."""
-  if "ads_mcp.server" in sys.modules:
-    del sys.modules["ads_mcp.server"]
+  """ADS_MCP_ENABLE_MUTATIONS=true loads the governed tier only."""
+  server_module = _reload_server(
+      {"ADS_MCP_ENABLE_MUTATIONS": "true"}, clear=False
+  )
 
-  with mock.patch.dict(os.environ, {"ADS_MCP_ENABLE_MUTATIONS": "true"}):
-    with (
-        mock.patch("ads_mcp.server.get_ads_client"),
-        mock.patch("ads_mcp.server.update_views_yaml"),
-        mock.patch("ads_mcp.server.mcp_server"),
-    ):
-      import ads_mcp.server as server_module  # pylint: disable=import-outside-toplevel, reimported
+  assert "mutations_gated" in server_module.loaded_tiers["governed"]
+  assert "gated_bidding" in server_module.loaded_tiers["governed"]
+  # Validate-only probing survives without enabling raw mutations.
+  assert server_module.loaded_tiers["validate"] == ["validation"]
+  # Raw tier stays closed: it needs its own explicit opt-in.
+  assert server_module.loaded_tiers["raw"] == []
 
-      tool_names = [t.__name__ for t in server_module.tools]
-      assert "ads_mcp.tools.mutations.budget" in tool_names
-      assert "ads_mcp.tools.mutations.campaign" in tool_names
+
+def test_raw_mutations_require_second_flag():
+  """Raw tools load only when BOTH flags are explicitly "true"."""
+  server_module = _reload_server(
+      {
+          "ADS_MCP_ENABLE_MUTATIONS": "true",
+          "ADS_MCP_ENABLE_RAW_MUTATIONS": "true",
+      },
+      clear=False,
+  )
+
+  assert "budget" in server_module.loaded_tiers["raw"]
+  assert "campaign" in server_module.loaded_tiers["raw"]
+  assert server_module.loaded_tiers["governed"]
