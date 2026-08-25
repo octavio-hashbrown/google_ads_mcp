@@ -37,26 +37,77 @@ Gated tools:
 | `reject_keyword_mutation(code, note)` | Rejects + archives a pending proposal |
 | `list_pending_approvals()` | Lists open proposals in the client queue |
 
-## ⚠️ Raw (un-gated) upstream tools are still available
+## ⚠️ Raw (un-gated) upstream tools — now behind a second flag
 
-By design choice, this fork **keeps the upstream raw mutation tools active**
-when `ADS_MCP_ENABLE_MUTATIONS=true`. Tools like `create_keywords`,
-`create_negative_campaign_keywords`, `remove_campaign_criterion` etc.
-execute immediately with **no approval gate**.
+The upstream raw mutation tools execute immediately with **no approval
+gate, no audit row, and no AFTER-state check**. Twelve of them exist, and
+several can start or increase spend on their first call
+(`update_campaign_status`, `create_campaign_budget`, `create_search_campaign`).
 
-**Default rule:** for Lo Media client work, always prefer the gated
-`propose_*` / `apply_*` flow. The raw tools exist for emergencies (e.g.,
-revert a misfire) where the propose round-trip would slow things down.
-Use of raw tools should still be announced to the client in your normal
-audit-execution rhythm.
+**As of 2026-08-25 they require a second, separate opt-in:**
+
+```
+ADS_MCP_ENABLE_MUTATIONS=true        # governed propose/approve/apply
+ADS_MCP_ENABLE_RAW_MUTATIONS=true    # + raw immediate execution
+```
+
+Both must be exactly `"true"`. Unset, empty, `"false"`, or malformed
+(`"1"`, `"yes"`, `"TRUE!"`) all fail closed. Raw is a strict superset of
+governed: raw tools can never load while the governed layer is off.
+
+**Default rule:** Lo Media client work runs with
+`ADS_MCP_ENABLE_RAW_MUTATIONS=false`. Use the gated `propose_*` /
+`apply_*` flow. Raw tools are for emergencies only (e.g. reverting a
+misfire) and require deliberately restarting the MCP with the flag on —
+which is the point: it cannot happen by accident mid-session.
+
+### The defect this replaced
+
+Before this change the flag did not work at all. Tool registration happens
+as an **import side effect** (`@mcp.tool()` at module scope), and
+`mutations/__init__.py` eagerly imported every raw tool module. Because
+`planning.py` — a read-only module loaded unconditionally — imports
+`mutations.common`, that chain registered all twelve raw tools in **every**
+configuration. Verified 2026-08-25: with `ADS_MCP_ENABLE_MUTATIONS` unset,
+12 raw tools were exposed and 0 governed tools were — strictly the worst
+posture available. The `tools = [...]` list in the entrypoints was assigned
+but never consumed, so it controlled nothing.
+
+The fix is structural: `mutations/__init__.py` no longer imports the tool
+modules, and `ads_mcp/tools/loader.py` is the single place that imports
+each tier, shared by both entrypoints. Regression cover lives in
+`tests/test_raw_mutation_gate.py`, which asserts on the tools a freshly
+imported server *actually registers* — not on a list.
+
+## Validate-only probing
+
+`validate_only_capability_check` (in `ads_mcp/tools/validation.py`) loads
+with the **governed** tier and does not require raw mutations. It confirms
+that credentials, developer token, and OAuth scope are authorized to submit
+mutations, without writing anything:
+
+- `validate_only` is a pinned module constant, asserted before every call;
+  there is no code path that sets it False.
+- Every operation is **zero-delta** — it rewrites the value it just read —
+  so the net change is nil even if the flag were ignored.
+- Probe targets prefer PAUSED campaigns.
+
+It proves a mutation *could* be submitted. It is never evidence that one
+*should* be, and it is not a substitute for the approval gate.
 
 ## Configuration
 
-- `ADS_MCP_ENABLE_MUTATIONS=true` — enables all mutation tools (raw + gated)
+- `ADS_MCP_ENABLE_MUTATIONS=true` — enables the **governed** tier
+  (`propose_*` / `apply_*`) plus `validate_only_capability_check`.
+- `ADS_MCP_ENABLE_RAW_MUTATIONS=true` — additionally enables the **raw**
+  immediate-execution tools. Requires the above. Defaults to false.
 - `LO_AGENCY_CLIENT_ROOT=/path/to/client/folder` — default location for
   `pending_approvals/`, `applied_approvals/`, `rejected_approvals/`,
   and `client_audit_log.md`. Each `propose_*` / `apply_*` call may also
   override via `client_root=...` arg.
+
+The resolved posture is printed to stderr at startup, e.g.
+`[ads-mcp governance] GOVERNED ONLY -- propose/approve/apply; raw tools NOT exposed`.
 
 ## File layout
 

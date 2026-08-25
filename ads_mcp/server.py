@@ -19,10 +19,7 @@ import os
 
 from ads_mcp.coordinator import mcp_server
 from ads_mcp.scripts.generate_views import update_views_yaml
-from ads_mcp.tools import accounts
-from ads_mcp.tools import docs
-from ads_mcp.tools import planning
-from ads_mcp.tools import reporting
+from ads_mcp.tools import loader
 from ads_mcp.tools._utils import get_ads_client
 import dotenv
 from fastmcp.server.auth.providers.google import GoogleProvider
@@ -31,36 +28,18 @@ from fastmcp.server.auth.providers.google import GoogleTokenVerifier
 dotenv.load_dotenv()
 
 
-# planning is read-only (Keyword Planner ideas), so it loads unconditionally
-# alongside the other read tools.
-tools = [reporting, accounts, docs, planning]
-
-if os.getenv("ADS_MCP_ENABLE_MUTATIONS", "false").lower() == "true":
-  from ads_mcp.tools import mutations  # pylint: disable=ungrouped-imports
-  from ads_mcp.tools import (  # pylint: disable=ungrouped-imports
-      gated_ad_copy,
-      gated_assets,
-      gated_bidding,
-      gated_conversions,
-      gated_migration,
-      mutations_gated,
-  )
-
-  tools.extend(
-      [
-          mutations.budget,
-          mutations.campaign,
-          mutations.ad_group,
-          mutations.ad,
-          mutations.criterion,
-          mutations_gated,
-          gated_bidding,
-          gated_assets,
-          gated_conversions,
-          gated_migration,
-          gated_ad_copy,
-      ]
-  )
+# Tool tiers are loaded by ads_mcp.tools.loader, which is the single
+# implementation shared by both entrypoints. Registration happens by import
+# side effect, so a tier that loader does not import is not registered.
+#
+#   READ      always on.
+#   VALIDATE  with governed tier; validate_only only, cannot commit.
+#   GOVERNED  ADS_MCP_ENABLE_MUTATIONS=true       -> propose/approve/apply.
+#   RAW       + ADS_MCP_ENABLE_RAW_MUTATIONS=true -> immediate execution.
+#
+# Both flags are required for RAW. Anything unset or malformed fails closed.
+# See ads_mcp/governance/flags.py.
+loaded_tiers = loader.load_tools()
 
 if os.getenv("USE_GOOGLE_OAUTH_ACCESS_TOKEN"):
   mcp_server.auth = GoogleTokenVerifier()
