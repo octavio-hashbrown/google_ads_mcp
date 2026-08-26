@@ -372,6 +372,7 @@ def _asset_conv_row(
     action=ACCOUNT_ACTION,
     all_conversions=3.0,
     level="campaign_asset",
+    link_status="ENABLED",
 ):
   """A CALL asset LINK carrying conversions segmented to an action."""
   row = types.SimpleNamespace(
@@ -385,9 +386,87 @@ def _asset_conv_row(
       segments=types.SimpleNamespace(conversion_action=action),
       metrics=types.SimpleNamespace(all_conversions=all_conversions),
   )
-  setattr(row, level, types.SimpleNamespace(asset=asset))
+  setattr(
+      row,
+      level,
+      types.SimpleNamespace(
+          asset=asset, status=types.SimpleNamespace(name=link_status)
+      ),
+  )
   return row
 
+
+
+@pytest.mark.parametrize("level", ["campaign_asset", "ad_group_asset"])
+@pytest.mark.parametrize("dead_status", ["REMOVED", "PAUSED"])
+def test_non_enabled_call_link_with_history_does_not_corroborate(
+    level, dead_status
+):
+  """A detached or paused link must never prove the path is live TODAY.
+
+  Verified live 2026-08-26 on 784-991-4897: a campaign_asset /
+  ad_group_asset query with only a field_type predicate returns REMOVED
+  links alongside ENABLED ones, and metrics still report their history.
+  Without an explicit status gate, a CALL asset detached yesterday would
+  satisfy corroboration on last-30-days conversions it earned while it
+  was still attached.
+  """
+  dead = [_asset_conv_row(level=level, link_status=dead_status)]
+  # The corroboration loop queries campaign links before ad-group
+  # links, so the dead row has to land on its own level's query.
+  links = [dead, []] if level == "campaign_asset" else [[], dead]
+  client, _ = _client([
+      [_settings_row()],
+      [],  # account-level reference does not resolve
+      [_ad_call_action_row()],
+      *links,
+  ])
+  settings, issues = gated_assets.verify_account_call_reporting(client, "123")
+
+  assert issues, f"a {dead_status} link must not corroborate"
+  assert "The account-level path is therefore unproven." in issues[0]
+  assert "unenumerable_account_reference" not in settings
+
+
+def test_corroboration_query_gates_link_status_in_gaql():
+  """The status gate must live in the GAQL, not only in Python.
+
+  Filtering in Python alone would still pull every removed link over the
+  wire and rely on the loop to discard them. Pin the predicate so a
+  future edit cannot quietly drop it.
+  """
+  client, services = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [],
+      [],
+  ])
+  gated_assets.verify_account_call_reporting(client, "123")
+
+  google_ads = services["GoogleAdsService"]
+  link_queries = [
+      c.kwargs["query"]
+      for c in google_ads.search.call_args_list
+      if "field_type = 'CALL'" in c.kwargs["query"]
+  ]
+  assert len(link_queries) == 2, "campaign and ad-group links are both checked"
+  for query in link_queries:
+    assert "status = 'ENABLED'" in query
+
+
+def test_enabled_link_still_corroborates_after_the_status_gate():
+  """Control: the gate must not break the legitimate Cop Call NY shape."""
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row(link_status="ENABLED")],
+  ])
+  settings, issues = gated_assets.verify_account_call_reporting(client, "123")
+
+  assert not issues
+  assert settings["unenumerable_account_reference"] == ACCOUNT_ACTION
 
 def test_unresolvable_action_with_account_level_asset_conversions_warns():
   """Cop Call NY shape: the ACCOUNT-LEVEL path itself is proven live."""
@@ -399,9 +478,9 @@ def test_unresolvable_action_with_account_level_asset_conversions_warns():
   ])
   settings, issues = gated_assets.verify_account_call_reporting(client, "123")
   assert issues == []
-  assert settings["system_managed_reference"] == ACCOUNT_ACTION
+  assert settings["unenumerable_account_reference"] == ACCOUNT_ACTION
   assert any(
-      "ACCEPTED WITH VERIFIED SYSTEM-MANAGED REFERENCE" in w
+      "ACCEPTED UNENUMERABLE ACCOUNT-LEVEL REFERENCE" in w
       for w in settings["warnings"]
   )
   assert any("UNKNOWN" in w for w in settings["warnings"])
@@ -426,7 +505,7 @@ def test_unrelated_converting_ad_call_action_does_not_corroborate():
   settings, issues = gated_assets.verify_account_call_reporting(client, "123")
   assert any("account-level path is therefore unproven" in i for i in issues)
   assert "warnings" not in settings
-  assert "system_managed_reference" not in settings
+  assert "unenumerable_account_reference" not in settings
 
 
 def test_resource_level_asset_conversions_do_not_corroborate():
@@ -471,7 +550,7 @@ def test_ad_group_level_asset_can_corroborate():
   ])
   settings, issues = gated_assets.verify_account_call_reporting(client, "123")
   assert issues == []
-  assert settings["system_managed_reference"] == ACCOUNT_ACTION
+  assert settings["unenumerable_account_reference"] == ACCOUNT_ACTION
 
 
 def test_reporting_disabled_is_never_bypassed_by_corroboration():
@@ -562,7 +641,7 @@ def test_apply_blocks_when_recorded_exception_is_for_another_reference():
   _, issues = gated_assets.verify_account_call_reporting(
       _corroborated_client(),
       "123",
-      accepted_system_managed_reference="customers/123/conversionActions/999",
+      accepted_unenumerable_account_reference="customers/123/conversionActions/999",
       require_recorded_exception=True,
   )
   assert any("does not carry a matching" in i for i in issues)
@@ -572,11 +651,11 @@ def test_apply_allows_when_matching_exception_was_recorded():
   settings, issues = gated_assets.verify_account_call_reporting(
       _corroborated_client(),
       "123",
-      accepted_system_managed_reference=ACCOUNT_ACTION,
+      accepted_unenumerable_account_reference=ACCOUNT_ACTION,
       require_recorded_exception=True,
   )
   assert issues == []
-  assert settings["system_managed_reference"] == ACCOUNT_ACTION
+  assert settings["unenumerable_account_reference"] == ACCOUNT_ACTION
 
 
 def test_account_action_not_ad_call_is_flagged():
@@ -1063,7 +1142,7 @@ def _apply(client, accepted=ACCOUNT_ACTION, expected=None):
       client,
       "123",
       expected,
-      accepted_system_managed_reference=accepted,
+      accepted_unenumerable_account_reference=accepted,
       require_recorded_exception=True,
   )
 
@@ -1114,7 +1193,7 @@ def test_apply_fails_when_qualifying_ad_call_action_is_gone():
 def test_apply_fails_when_configured_reference_changed_under_us():
   """Still unresolved, still corroborated -- but it is a DIFFERENT reference.
 
-  The approval was for one specific system-managed reference. It does not
+  The approval was for one specific unenumerable reference. It does not
   transfer to whatever the account now points at.
   """
   client, _ = _client([
@@ -1149,7 +1228,7 @@ def test_apply_still_succeeds_when_live_state_is_unchanged():
   ])
   settings, issues = _apply(client)
   assert issues == []
-  assert settings["system_managed_reference"] == ACCOUNT_ACTION
+  assert settings["unenumerable_account_reference"] == ACCOUNT_ACTION
 
 
 def test_apply_path_revalidates_live_and_demands_the_recorded_exception():
@@ -1158,7 +1237,7 @@ def test_apply_path_revalidates_live_and_demands_the_recorded_exception():
       "phone_number": "2017466577",
       "country_code": "US",
       "expected_account_call_conversion_action": ACCOUNT_ACTION,
-      "accepted_system_managed_reference": ACCOUNT_ACTION,
+      "accepted_unenumerable_account_reference": ACCOUNT_ACTION,
       "accepted_incompatibilities": [],
   }
   client, _ = _client([[_asset_row()]])
@@ -1169,4 +1248,4 @@ def test_apply_path_revalidates_live_and_demands_the_recorded_exception():
 
   kwargs = verifier.call_args.kwargs
   assert kwargs["require_recorded_exception"] is True
-  assert kwargs["accepted_system_managed_reference"] == ACCOUNT_ACTION
+  assert kwargs["accepted_unenumerable_account_reference"] == ACCOUNT_ACTION

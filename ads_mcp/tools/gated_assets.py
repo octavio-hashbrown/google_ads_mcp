@@ -246,6 +246,17 @@ def _find_account_level_call_attribution(
   segmented to an ENABLED AD_CALL/CALL_FROM_ADS action. That combination
   cannot occur unless the account-level path is live.
 
+  The link must additionally be currently ENABLED. This is not
+  belt-and-braces: campaign_asset / ad_group_asset queries that carry
+  no status predicate return REMOVED links alongside ENABLED ones
+  (verified live 2026-08-26 against 784-991-4897, where an unfiltered
+  field_type-only query returned REMOVED and ENABLED rows together),
+  and metrics.all_conversions still reports historical conversions for
+  a removed link. Without the status predicate a CALL asset detached
+  yesterday could 'prove' the account-level path is live today. PAUSED
+  is excluded on the same reasoning -- a link that is not serving
+  cannot evidence a current path.
+
   Both campaign-level and ad-group-level links are checked.
 
   Returns:
@@ -264,11 +275,12 @@ def _find_account_level_call_attribution(
       ("ad_group_asset", "ad_group_asset.asset"),
   ):
     query = (
-        f"SELECT {parent_field}, "
+        f"SELECT {parent_field}, {resource}.status, "
         "asset.call_asset.call_conversion_reporting_state, "
         "segments.conversion_action, metrics.all_conversions "
         f"FROM {resource} "
         f"WHERE {resource}.field_type = 'CALL' "
+        f"AND {resource}.status = 'ENABLED' "
         "AND segments.date DURING LAST_30_DAYS "
         f"AND segments.conversion_action IN ({in_list})"
     )
@@ -277,6 +289,11 @@ def _find_account_level_call_attribution(
     except GoogleAdsException as e:
       _handle_google_ads_error(e)
     for row in rows:
+      # Re-assert the link status in Python too. The GAQL predicate
+      # above is the real gate; this is a cheap guard against a future
+      # edit dropping it silently.
+      if getattr(row, resource).status.name != "ENABLED":
+        continue
       state = row.asset.call_asset.call_conversion_reporting_state.name
       if state != "USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION":
         continue
@@ -285,6 +302,7 @@ def _find_account_level_call_attribution(
       action_resource = row.segments.conversion_action
       return {
           "level": resource,
+          "link_status": getattr(row, resource).status.name,
           "asset": getattr(row, resource).asset,
           "reporting_state": state,
           "action_resource": action_resource,
@@ -299,7 +317,7 @@ def verify_account_call_reporting(
     customer_id: str,
     expected_call_conversion_action: str | None = None,
     *,
-    accepted_system_managed_reference: str | None = None,
+    accepted_unenumerable_account_reference: str | None = None,
     require_recorded_exception: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
   """Verifies account-level call reporting is intact.
@@ -314,6 +332,15 @@ def verify_account_call_reporting(
       expected_call_conversion_action: Resource name the account-level
           call conversion action must still be. Pass the value recorded
           at propose time to detect drift before applying.
+      accepted_unenumerable_account_reference: The unenumerable
+          account-level reference a human explicitly accepted when the
+          proposal was approved. Its literal semantics are UNKNOWN by
+          design; this is an identity match, not an interpretation.
+      require_recorded_exception: When True (APPLY), an unenumerable
+          reference is tolerated ONLY if it matches
+          `accepted_unenumerable_account_reference`. When False
+          (PROPOSE), live corroboration alone downgrades it to a
+          surfaced warning.
 
   Returns:
       (settings, issues). `settings` carries the raw values plus the
@@ -365,10 +392,12 @@ def verify_account_call_reporting(
   settings["resolved_action"] = resolved
 
   if resolved is None:
-    # An account-level reference that will not enumerate is ambiguous: it
-    # is either a genuinely broken pointer, or a Google system-managed
-    # action the customer-scoped conversion_action report does not return.
-    # Only positive, call-specific evidence separates the two. Every other
+    # An account-level reference that will not enumerate is ambiguous:
+    # it may be a genuinely broken pointer, or an account-level
+    # reference the customer-scoped conversion_action report simply does
+    # not enumerate. Its literal semantics are UNKNOWN and this code
+    # asserts no explanation for it -- only positive, call-specific
+    # evidence separates 'dead' from 'live'. Every other
     # account-level fault must already be clean (`not issues`), so a
     # disabled flag or a drifted reference can never be bypassed here.
     corroboration = None
@@ -396,31 +425,40 @@ def verify_account_call_reporting(
     # APPLY it is not enough on its own: the approved proposal must carry
     # the same exception, so a human explicitly reviewed and accepted it.
     if require_recorded_exception and (
-        accepted_system_managed_reference != action_resource
+        accepted_unenumerable_account_reference != action_resource
     ):
       issues.append(
-          "Refusing to apply under a system-managed account-level call "
+          "Refusing to apply under an unenumerable account-level call "
           f"conversion reference ({action_resource}): the approved "
           "proposal does not carry a matching, explicitly accepted "
-          "system-managed-reference exception "
-          f"(recorded: {accepted_system_managed_reference or 'none'}). "
+          "account-level-call-reference exception (recorded: "
+          f"{accepted_unenumerable_account_reference or 'none'}). "
           "Re-propose so the exception is reviewed and approved."
       )
       return settings, issues
 
-    settings["system_managed_reference"] = action_resource
+    settings["unenumerable_account_reference"] = action_resource
     settings.setdefault("warnings", []).append(
-        "ACCEPTED WITH VERIFIED SYSTEM-MANAGED REFERENCE: account-level "
-        f"call conversion action {action_resource} does not enumerate "
-        "through the conversion_action report for this customer, which is "
-        "consistent with a Google system-managed reference. Its literal "
-        "identity is UNKNOWN. The account-level path was proven live "
-        "instead: CALL asset "
-        f"{corroboration['asset']} ({corroboration['level']}) is configured "
+        "ACCEPTED UNENUMERABLE ACCOUNT-LEVEL REFERENCE WITH LIVE PATH "
+        "CORROBORATION: account-level call conversion action "
+        f"{action_resource} does not enumerate through the "
+        "conversion_action report for this customer. Its literal "
+        "identity and semantics remain UNKNOWN, and no explanation for "
+        "it is asserted here. The authoritative Google Ads UI reports "
+        "the account-level call conversion action as 'Not set yet' "
+        "(observed 2026-08-26), which is most consistent with an "
+        "unenumerable pointer associated with Google default "
+        "calls-from-ads fallback behaviour -- but that reading is NOT "
+        "verified and must not be relied on. What IS verified is the "
+        "path: CALL asset "
+        f"{corroboration['asset']} ({corroboration['level']}, link "
+        f"{corroboration['link_status']}) is configured "
         "USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION and carried "
         f"{corroboration['all_conversions']:g} conversions attributed to "
         f"\"{corroboration['action_name']}\" "
-        f"({corroboration['action_resource']}) in the last 30 days."
+        f"({corroboration['action_resource']}) in the last 30 days. "
+        "The unusual API representation is therefore tolerated only "
+        "under explicit human approval, not because it is understood."
     )
     return settings, issues
 
@@ -912,8 +950,8 @@ def _prepare_attachment(
       # live. Apply refuses to tolerate that state unless this exact
       # reference is carried here, so approving the proposal is what
       # accepts the exception.
-      "accepted_system_managed_reference": account.get(
-          "system_managed_reference"
+      "accepted_unenumerable_account_reference": account.get(
+          "unenumerable_account_reference"
       ),
   }
   for warning in account.get("warnings", []):
@@ -1179,14 +1217,14 @@ def _resolve_asset_for_apply(
     )
 
   # Account-level attribution must also still hold. At apply, a
-  # system-managed (unenumerable) reference is only tolerated when the
+  # unenumerable account-level reference is only tolerated when the
   # approved proposal explicitly recorded that exception.
   _, account_issues = verify_account_call_reporting(
       ads_client,
       customer_id,
       spec.get("expected_account_call_conversion_action"),
-      accepted_system_managed_reference=spec.get(
-          "accepted_system_managed_reference"
+      accepted_unenumerable_account_reference=spec.get(
+          "accepted_unenumerable_account_reference"
       ),
       require_recorded_exception=True,
   )
