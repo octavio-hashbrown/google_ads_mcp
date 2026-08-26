@@ -59,7 +59,16 @@ _ACCOUNT_LEVEL_REPORTING_STATES = frozenset({
 
 _RESOURCE_LEVEL_REPORTING_STATE = "USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION"
 
+# NON-REMOVED. Used where the question is "does a link still exist here",
+# e.g. duplicate detection before attaching.
 _ACTIVE_LINK_STATUSES = frozenset({"ENABLED", "PAUSED"})
+
+# SERVING. Used where the question is "is a phone number actually being
+# advertised right now". A PAUSED call asset exists but is not reachable
+# by a searcher, so it provides no replacement coverage and must never
+# justify detaching the number it is supposed to be replacing. These two
+# sets are deliberately NOT synonyms; do not collapse them.
+_SERVING_CALL_LINK_STATUSES = frozenset({"ENABLED"})
 
 
 def _digits(phone: str) -> str:
@@ -1436,13 +1445,24 @@ def propose_detach_call_asset_from_campaign(
   then silently advertises none is a worse state than the one being
   corrected, so the replacement must be attached and verified first.
 
-  The proposal records the full identity of every CALL link expected to
-  survive the detach. Apply re-verifies that exact set: the approval
-  covers the specific replacement state a human reviewed, not the much
-  weaker claim that some phone number will still be attached. If the
-  replacement that justified the approval is gone, or has been edited
-  to carry a different number, apply hard-fails and the change must be
-  re-proposed rather than silently executed against different state.
+  Coverage means SERVING coverage. Only ENABLED links count: a PAUSED
+  call asset exists but advertises nothing, so it can neither justify a
+  detach at propose time nor stand in for the approved replacement at
+  apply time.
+
+  The proposal records the full identity of every ENABLED CALL link
+  expected to survive the detach -- resource name, asset, phone number
+  and country code -- plus the target's own status. Apply re-verifies
+  that exact set: the approval covers the specific replacement state a
+  human reviewed, not the much weaker claim that some phone number will
+  still be attached. If the replacement that justified the approval is
+  gone, has been paused, or has been edited to carry a different number
+  or country code, apply hard-fails and the change must be re-proposed
+  rather than silently executed against different state.
+
+  Country code is compared separately because _same_number() ignores
+  country prefixes by design, so identical local digits under a
+  different country are a different number.
 
   Args:
       customer_id: Google Ads customer ID (digits only).
@@ -1470,19 +1490,38 @@ def propose_detach_call_asset_from_campaign(
         f'linked to "{campaign_name}". Nothing to detach.'
     )
 
+  others = [
+      l for l in links if l["resource_name"] != target["resource_name"]
+  ]
+  # Coverage means SERVING coverage. A paused call asset is not
+  # advertising a phone number, so it cannot justify removing the number
+  # it is meant to replace.
   remaining = [
+      l for l in others if l["status"] in _SERVING_CALL_LINK_STATUSES
+  ]
+  paused = [
       l
-      for l in links
-      if l["resource_name"] != target["resource_name"]
-      and l["status"] in _ACTIVE_LINK_STATUSES
+      for l in others
+      if l["status"] in _ACTIVE_LINK_STATUSES
+      and l["status"] not in _SERVING_CALL_LINK_STATUSES
   ]
   if not remaining:
+    detail = ""
+    if paused:
+      paused_numbers = ", ".join(l["phone_number"] for l in paused)
+      detail = (
+          f" The only other CALL asset(s) here are PAUSED "
+          f"({paused_numbers}), which advertise nothing, so they do not "
+          f"count as replacement coverage."
+      )
     raise ToolError(
         "STOPPING FOR APPROVAL. Detaching "
         f"{target['phone_number']} would leave \"{campaign_name}\" with no "
-        "active CALL asset at all, so the campaign would advertise no "
-        "phone number. Attach the replacement number first, verify it "
-        "live, then re-propose this detach."
+        "ENABLED CALL asset at all, so the campaign would advertise no "
+        "reachable phone number."
+        + detail
+        + " Attach the replacement number first, verify it is ENABLED, "
+        "then re-propose this detach."
     )
 
   human_lines = [
@@ -1497,17 +1536,33 @@ def propose_detach_call_asset_from_campaign(
           "link to it. Other campaigns using the same asset are unaffected."
       ),
       (
-          "Remaining active CALL asset(s) on this campaign afterwards: "
+          "Remaining SERVING (ENABLED) CALL asset(s) on this campaign "
+          "afterwards: "
           + ", ".join(
               f"{l['phone_number']} [{l['status']}]" for l in remaining
           )
       ),
+      *(
+          [
+              (
+                  "Also present but NOT counted as coverage (paused, "
+                  "advertising nothing): "
+                  + ", ".join(
+                      f"{l['phone_number']} [{l['status']}]"
+                      for l in paused
+                  )
+              )
+          ]
+          if paused
+          else []
+      ),
       (
           "APPROVING THIS PROPOSAL APPROVES THAT EXACT REMAINING STATE. "
-          "If any of those links is gone, or no longer carries the same "
-          "asset and number, apply will refuse and this must be "
-          "re-proposed. A different phone number that happens to be "
-          "active at apply time is NOT an acceptable substitute."
+          "If any of those links is gone, has been paused, or no longer "
+          "carries the same asset, number and country code, apply will "
+          "refuse and this must be re-proposed. A different phone number "
+          "that happens to be active at apply time is NOT an acceptable "
+          "substitute, and neither is a paused one."
       ),
   ]
 
@@ -1518,10 +1573,15 @@ def propose_detach_call_asset_from_campaign(
       "asset_resource_name": target["asset"],
       "phone_number": phone_number,
       "country_code": country_code.upper(),
+      # Frozen so apply can detect drift in the target itself, not only
+      # in the replacements.
+      "expected_target_status": target["status"],
       # Full identity, not bare resource names: apply has to be able to
-      # prove the approved replacement itself is still there, carrying
-      # the same asset and the same number.
-      "expected_remaining_active_links": [
+      # prove the approved replacement itself is still there, still
+      # SERVING, and still carrying the same asset, number and country.
+      # The key name says 'serving', not 'active', because only ENABLED
+      # links are recorded here.
+      "expected_remaining_serving_links": [
           {
               "resource_name": l["resource_name"],
               "asset": l["asset"],
@@ -1571,11 +1631,30 @@ def _execute_detach_call_asset_from_campaign(
         "campaign_asset": link_resource_name,
     }
 
+  # Google Ads keeps REMOVED asset-link rows and still returns them, so the
+  # approved target being "already detached" shows up as a REMOVED row
+  # rather than an absent one. Verified live 2026-08-26 on 784-991-4897.
+  # Both mean the same thing operationally: the work is already done. Never
+  # push another remove, and never fall through to pick some other link that
+  # happens to carry the same number -- that would detach the replacement.
+  if target["status"] == "REMOVED":
+    return {
+        "outcome": "no_op",
+        "detail": (
+            "The approved link is already detached (status REMOVED); "
+            "nothing to do."
+        ),
+        "campaign_asset": link_resource_name,
+        "status": target["status"],
+    }
+
   # The target must still be the exact link that was approved. The
   # resource name pins the campaign and the asset, but an asset's phone
-  # number can be edited in place -- same link, different number. Detaching
-  # on a stale number would remove a good number under an approval that
-  # was granted to remove a bad one.
+  # number and country code can be edited in place -- same link, different
+  # number. Detaching on stale details would remove a good number under an
+  # approval granted to remove a bad one. _same_number() deliberately
+  # ignores formatting AND country prefixes, so the country code has to be
+  # compared separately or "+1 201..." and "+44 201..." would look equal.
   if target["asset"] != spec["asset_resource_name"]:
     raise ToolError(
         "Refusing to apply: link "
@@ -1590,52 +1669,106 @@ def _execute_detach_call_asset_from_campaign(
         "approval, so detaching it would remove a number nobody reviewed. "
         "Re-propose."
     )
+  if target["country_code"].upper() != str(
+      spec.get("country_code", "")
+  ).upper():
+    raise ToolError(
+        "Refusing to apply: link "
+        f"{link_resource_name} now carries country code "
+        f"{target['country_code']}, not the approved "
+        f"{spec.get('country_code')}. Re-propose."
+    )
+
+  # Status drift on the target itself is material. A link approved for
+  # removal while ENABLED behaves differently from the same link once
+  # paused, and either way the reviewed state is no longer what is in
+  # front of us.
+  expected_target_status = spec.get("expected_target_status")
+  if not expected_target_status:
+    raise ToolError(
+        "Refusing to apply: this proposal does not record the approved "
+        "status of the target link, so target drift cannot be detected. "
+        "Re-propose."
+    )
+  if target["status"] != expected_target_status:
+    raise ToolError(
+        "Refusing to apply: link "
+        f"{link_resource_name} was {expected_target_status} when approved "
+        f"and is now {target['status']}. Re-propose."
+    )
 
   # The approval covers ONE specific remaining state, not "some phone
   # number will still be attached". Requiring merely a non-empty remaining
   # list would let an unrelated number stand in for the replacement that
   # actually justified the approval.
-  approved_remaining = spec.get("expected_remaining_active_links") or []
+  approved_remaining = spec.get("expected_remaining_serving_links") or []
   if not approved_remaining or not all(
       isinstance(l, dict) for l in approved_remaining
   ):
     raise ToolError(
         "Refusing to apply: this proposal does not record the approved "
-        "remaining CALL links as full identities, so the approved "
+        "remaining SERVING CALL links as full identities, so the approved "
         "replacement state cannot be re-verified. Re-propose."
     )
 
-  current_active = {
-      l["resource_name"]: l
-      for l in links
-      if l["status"] in _ACTIVE_LINK_STATUSES
-  }
+  by_resource = {l["resource_name"]: l for l in links}
   for approved in approved_remaining:
-    live = current_active.get(approved["resource_name"])
+    live = by_resource.get(approved["resource_name"])
     if live is None:
       raise ToolError(
           "Refusing to apply: the approved replacement link "
           f"{approved['resource_name']} ({approved['phone_number']}) is no "
-          "longer an active CALL link on this campaign. The state that "
-          "justified this approval is gone -- a different active number is "
-          "NOT a substitute. Re-propose."
+          "longer present on this campaign. The state that justified this "
+          "approval is gone -- a different active number is NOT a "
+          "substitute. Re-propose."
       )
-    if live["asset"] != approved["asset"] or not _same_number(
-        live["phone_number"], approved["phone_number"]
-    ):
+    # SERVING, not merely non-removed. A paused replacement advertises
+    # nothing, so detaching the number it was supposed to replace would
+    # leave the campaign with no reachable phone number at all.
+    if live["status"] not in _SERVING_CALL_LINK_STATUSES:
+      raise ToolError(
+          "Refusing to apply: the approved replacement link "
+          f"{approved['resource_name']} ({approved['phone_number']}) is now "
+          f"{live['status']}, not ENABLED. A paused call asset provides no "
+          "serving replacement coverage, so detaching "
+          f"{spec['phone_number']} would leave this campaign advertising no "
+          "reachable number. Re-propose."
+      )
+    if live["asset"] != approved["asset"]:
+      raise ToolError(
+          "Refusing to apply: the approved replacement link "
+          f"{approved['resource_name']} now points at asset "
+          f"{live['asset']}, not the approved {approved['asset']}. "
+          "Re-propose."
+      )
+    if not _same_number(live["phone_number"], approved["phone_number"]):
       raise ToolError(
           "Refusing to apply: the approved replacement link "
           f"{approved['resource_name']} now carries "
-          f"{live['phone_number']} (asset {live['asset']}), not the "
-          f"approved {approved['phone_number']} (asset {approved['asset']}). "
-          "Re-propose."
+          f"{live['phone_number']}, not the approved "
+          f"{approved['phone_number']}. Re-propose."
+      )
+    if live["country_code"].upper() != str(
+        approved.get("country_code", "")
+    ).upper():
+      raise ToolError(
+          "Refusing to apply: the approved replacement link "
+          f"{approved['resource_name']} now carries country code "
+          f"{live['country_code']}, not the approved "
+          f"{approved.get('country_code')}. The local digits may match, but "
+          "it is a different number. Re-propose."
       )
 
   # Links that appeared since approval are tolerated: they cannot strand
   # the campaign and they are not what is being removed. They are surfaced
   # in the result so the drift is still visible to whoever reads the audit.
   unapproved = sorted(
-      set(current_active) - {a["resource_name"] for a in approved_remaining}
+      {
+          l["resource_name"]
+          for l in links
+          if l["status"] in _ACTIVE_LINK_STATUSES
+      }
+      - {a["resource_name"] for a in approved_remaining}
       - {link_resource_name}
   )
 
@@ -1673,13 +1806,24 @@ def _execute_detach_call_asset_from_campaign(
           a["resource_name"] for a in approved_remaining
       ],
       "unapproved_additional_links_present_at_apply": unapproved,
-      "remaining_active_links": [
+      "remaining_serving_links": [
           {
               "resource_name": l["resource_name"],
               "phone_number": l["phone_number"],
+              "status": l["status"],
+          }
+          for l in verified
+          if l["status"] in _SERVING_CALL_LINK_STATUSES
+      ],
+      "remaining_non_serving_links": [
+          {
+              "resource_name": l["resource_name"],
+              "phone_number": l["phone_number"],
+              "status": l["status"],
           }
           for l in verified
           if l["status"] in _ACTIVE_LINK_STATUSES
+          and l["status"] not in _SERVING_CALL_LINK_STATUSES
       ],
       "verified_by": "GAQL read-back of campaign_asset",
   }
