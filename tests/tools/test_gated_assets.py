@@ -1043,3 +1043,130 @@ def test_existing_shared_assets_are_never_modified():
   source = open(gated_assets.__file__, encoding="utf-8").read()
   assert "AssetOperation(update=" not in source
   assert "mutate_assets" in source  # create path exists
+
+
+# ---------------------------------------------------------------------------
+# APPLY-time revalidation (time-of-check / time-of-use).
+#
+# Every test below simulates: propose ran, corroboration held, the exception
+# was recorded, a human approved -- and THEN the live state changed before
+# apply. An approved exception is permission to tolerate a verified unusual
+# state, never a substitute for verifying that state is still true.
+# ---------------------------------------------------------------------------
+
+
+NEW_REF = "customers/123/conversionActions/424242"
+
+
+def _apply(client, accepted=ACCOUNT_ACTION, expected=None):
+  return gated_assets.verify_account_call_reporting(
+      client,
+      "123",
+      expected,
+      accepted_system_managed_reference=accepted,
+      require_recorded_exception=True,
+  )
+
+
+def test_apply_fails_when_corroborating_link_has_disappeared():
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [],  # campaign link gone
+      [],  # ad-group link gone
+  ])
+  settings, issues = _apply(client)
+  assert any("account-level path is therefore unproven" in i for i in issues)
+  assert "warnings" not in settings
+
+
+def test_apply_fails_when_asset_left_account_level_reporting():
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row(reporting_state=RESOURCE_LEVEL)],
+      [],
+  ])
+  _, issues = _apply(client)
+  assert any("account-level path is therefore unproven" in i for i in issues)
+
+
+def test_apply_fails_when_corroborating_conversions_fell_to_zero():
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row(all_conversions=0.0)],
+      [],
+  ])
+  _, issues = _apply(client)
+  assert any("account-level path is therefore unproven" in i for i in issues)
+
+
+def test_apply_fails_when_qualifying_ad_call_action_is_gone():
+  client, _ = _client([[_settings_row()], [], []])
+  _, issues = _apply(client)
+  assert any("account-level path is therefore unproven" in i for i in issues)
+
+
+def test_apply_fails_when_configured_reference_changed_under_us():
+  """Still unresolved, still corroborated -- but it is a DIFFERENT reference.
+
+  The approval was for one specific system-managed reference. It does not
+  transfer to whatever the account now points at.
+  """
+  client, _ = _client([
+      [_settings_row(action=NEW_REF)],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row()],
+  ])
+  settings, issues = _apply(client, accepted=ACCOUNT_ACTION)
+  assert any("does not carry a matching" in i for i in issues)
+  assert "warnings" not in settings
+
+
+def test_apply_fails_when_reference_changed_and_expected_drift_also_fires():
+  client, _ = _client([
+      [_settings_row(action=NEW_REF)],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row()],
+  ])
+  _, issues = _apply(client, accepted=ACCOUNT_ACTION, expected=ACCOUNT_ACTION)
+  assert any("changed" in i for i in issues)
+
+
+def test_apply_still_succeeds_when_live_state_is_unchanged():
+  """Control: the same approved exception passes while conditions hold."""
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row()],
+  ])
+  settings, issues = _apply(client)
+  assert issues == []
+  assert settings["system_managed_reference"] == ACCOUNT_ACTION
+
+
+def test_apply_path_revalidates_live_and_demands_the_recorded_exception():
+  """The apply path must re-run the verifier, not trust the proposal."""
+  spec = {
+      "phone_number": "2017466577",
+      "country_code": "US",
+      "expected_account_call_conversion_action": ACCOUNT_ACTION,
+      "accepted_system_managed_reference": ACCOUNT_ACTION,
+      "accepted_incompatibilities": [],
+  }
+  client, _ = _client([[_asset_row()]])
+  with mock.patch.object(
+      gated_assets, "verify_account_call_reporting", return_value=({}, [])
+  ) as verifier:
+    gated_assets._resolve_asset_for_apply(client, "123", spec)
+
+  kwargs = verifier.call_args.kwargs
+  assert kwargs["require_recorded_exception"] is True
+  assert kwargs["accepted_system_managed_reference"] == ACCOUNT_ACTION
