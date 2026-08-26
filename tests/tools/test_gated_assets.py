@@ -346,10 +346,123 @@ def test_account_action_drift_is_flagged():
   assert any("changed" in i for i in issues)
 
 
-def test_account_action_that_does_not_resolve_is_flagged():
-  client, _ = _client([[_settings_row()], []])
+# ---------------------------------------------------------------------------
+# Unresolvable account-level reference.
+#
+# This is the ONLY account-level fault that may be downgraded, and only on
+# positive, call-specific evidence. Everything else stays fail-closed.
+# ---------------------------------------------------------------------------
+
+
+def _corroboration_row(
+    resource_name="customers/123/conversionActions/6734917828",
+    name="Calls from ads",
+    type_="AD_CALL",
+    origin="CALL_FROM_ADS",
+    status="ENABLED",
+    all_conversions=26.0,
+):
+  return types.SimpleNamespace(
+      conversion_action=types.SimpleNamespace(
+          resource_name=resource_name,
+          id=6734917828,
+          name=name,
+          status=types.SimpleNamespace(name=status),
+          type_=types.SimpleNamespace(name=type_),
+          origin=types.SimpleNamespace(name=origin),
+      ),
+      metrics=types.SimpleNamespace(all_conversions=all_conversions),
+  )
+
+
+def test_unresolvable_action_with_live_ad_call_warns_not_blocks():
+  """Cop Call NY shape: reference will not enumerate, calls demonstrably count."""
+  client, _ = _client([
+      [_settings_row()],  # account settings healthy
+      [],  # account-level reference does not resolve
+      [_corroboration_row()],  # but AD_CALL/CALL_FROM_ADS is counting
+  ])
+  settings, issues = gated_assets.verify_account_call_reporting(client, "123")
+  assert issues == []
+  assert any(
+      "ACCEPTED WITH VERIFIED SYSTEM-MANAGED REFERENCE" in w
+      for w in settings["warnings"]
+  )
+  assert any("Calls from ads" in w for w in settings["warnings"])
+  assert any("UNKNOWN" in w for w in settings["warnings"])
+
+
+def test_unresolvable_action_with_no_ad_call_action_blocks():
+  """No corroborating evidence at all -> still a hard failure."""
+  client, _ = _client([[_settings_row()], [], []])
   _, issues = gated_assets.verify_account_call_reporting(client, "123")
   assert any("does not" in i and "resolve" in i for i in issues)
+
+
+def test_unresolvable_action_with_zero_conversion_ad_call_blocks():
+  """An AD_CALL action that exists but counts nothing is not evidence."""
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_corroboration_row(all_conversions=0.0)],
+  ])
+  _, issues = gated_assets.verify_account_call_reporting(client, "123")
+  assert any("corroborate" in i for i in issues)
+
+
+def test_reporting_disabled_is_never_bypassed_by_corroboration():
+  client, _ = _client([
+      [_settings_row(reporting=False)],
+      [],
+      [_corroboration_row()],
+  ])
+  settings, issues = gated_assets.verify_account_call_reporting(client, "123")
+  assert any("call reporting is DISABLED" in i for i in issues)
+  assert "warnings" not in settings
+
+
+def test_conversion_reporting_disabled_is_never_bypassed_by_corroboration():
+  client, _ = _client([
+      [_settings_row(conversion_reporting=False)],
+      [],
+      [_corroboration_row()],
+  ])
+  settings, issues = gated_assets.verify_account_call_reporting(client, "123")
+  assert any("CONVERSION reporting is DISABLED" in i for i in issues)
+  assert "warnings" not in settings
+
+
+def test_action_drift_is_never_bypassed_by_corroboration():
+  client, _ = _client([
+      [_settings_row(action="customers/123/conversionActions/999")],
+      [],
+      [_corroboration_row()],
+  ])
+  settings, issues = gated_assets.verify_account_call_reporting(
+      client, "123", ACCOUNT_ACTION
+  )
+  assert any("changed" in i for i in issues)
+  assert "warnings" not in settings
+
+
+def test_corroboration_query_cannot_be_satisfied_by_unrelated_conversions():
+  """Only ENABLED AD_CALL/CALL_FROM_ADS with recent conversions may corroborate.
+
+  Guards the reviewer's requirement that unrelated conversion activity
+  (form fills, website calls, imports) can never bypass a genuinely broken
+  account-level configuration.
+  """
+  client, services = _client([
+      [_settings_row()],
+      [],
+      [_corroboration_row()],
+  ])
+  gated_assets.verify_account_call_reporting(client, "123")
+  query = services["GoogleAdsService"].search.call_args_list[-1].kwargs["query"]
+  assert "conversion_action.status = 'ENABLED'" in query
+  assert "conversion_action.type = 'AD_CALL'" in query
+  assert "conversion_action.origin = 'CALL_FROM_ADS'" in query
+  assert "LAST_30_DAYS" in query
 
 
 def test_account_action_not_ad_call_is_flagged():

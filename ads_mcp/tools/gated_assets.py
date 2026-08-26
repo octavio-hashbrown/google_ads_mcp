@@ -204,6 +204,54 @@ def _read_account_call_settings(
   raise ToolError(f"Could not read call reporting settings for {customer_id}.")
 
 
+def _find_live_ad_call_attribution(
+    ads_client, customer_id: str
+) -> dict[str, Any] | None:
+  """Finds an ENABLED AD_CALL/CALL_FROM_ADS action counting calls now.
+
+  This is deliberately narrow. It is the ONLY evidence accepted as
+  corroboration that an account-level call conversion action which the
+  API will not enumerate is nonetheless operative. Google can manage an
+  account-level call conversion action whose resource is not returned by
+  a `conversion_action` query scoped to the customer, while the AD_CALL
+  action it feeds is returned and is visibly counting.
+
+  Unrelated conversion activity does NOT qualify: the action must be
+  ENABLED, of type AD_CALL, with origin CALL_FROM_ADS, and must have
+  recorded conversions in the last 30 days. Form fills, website calls
+  and every other conversion type are ignored on purpose, because none
+  of them demonstrate that ad-call attribution is working.
+
+  Returns:
+      The corroborating action, or None if no such evidence exists.
+  """
+  service = ads_client.get_service("GoogleAdsService")
+  query = (
+      "SELECT conversion_action.resource_name, conversion_action.id, "
+      "conversion_action.name, conversion_action.status, "
+      "conversion_action.type, conversion_action.origin, "
+      "metrics.all_conversions "
+      "FROM conversion_action "
+      "WHERE conversion_action.status = 'ENABLED' "
+      "AND conversion_action.type = 'AD_CALL' "
+      "AND conversion_action.origin = 'CALL_FROM_ADS' "
+      "AND segments.date DURING LAST_30_DAYS "
+      "LIMIT 10"
+  )
+  try:
+    rows = service.search(customer_id=customer_id, query=query)
+  except GoogleAdsException as e:
+    _handle_google_ads_error(e)
+  for row in rows:
+    if row.metrics.all_conversions > 0:
+      return {
+          "resource_name": row.conversion_action.resource_name,
+          "name": row.conversion_action.name,
+          "all_conversions": row.metrics.all_conversions,
+      }
+  return None
+
+
 def verify_account_call_reporting(
     ads_client,
     customer_id: str,
@@ -226,7 +274,14 @@ def verify_account_call_reporting(
       (settings, issues). `settings` carries the raw values plus the
       resolved conversion action under "resolved_action". A non-empty
       `issues` list means call attribution is not in the state that
-      justified reuse.
+      justified reuse, and callers treat it as a hard block.
+
+      `settings["warnings"]` is present only when a fault was downgraded
+      to a non-blocking warning on positive evidence. Today that applies
+      to exactly one case: an account-level action that will not
+      enumerate while an ENABLED AD_CALL/CALL_FROM_ADS action is visibly
+      counting conversions. Warnings must be surfaced to the approver,
+      never silently swallowed.
   """
   settings = _read_account_call_settings(ads_client, customer_id)
   issues = []
@@ -265,10 +320,39 @@ def verify_account_call_reporting(
   settings["resolved_action"] = resolved
 
   if resolved is None:
-    issues.append(
-        f"Account-level call conversion action {action_resource} does not "
-        "resolve to a conversion action in this customer."
-    )
+    # An account-level reference that will not enumerate is ambiguous: it
+    # is either a genuinely broken pointer, or a Google system-managed
+    # action the customer-scoped conversion_action report does not return.
+    # Only positive, call-specific evidence separates the two. Every other
+    # account-level fault must already be clean (`not issues`), so a
+    # disabled flag or a drifted reference can never be bypassed here.
+    corroboration = None
+    if (
+        settings["call_reporting_enabled"]
+        and settings["call_conversion_reporting_enabled"]
+        and not issues
+    ):
+      corroboration = _find_live_ad_call_attribution(ads_client, customer_id)
+
+    if corroboration:
+      settings.setdefault("warnings", []).append(
+          "ACCEPTED WITH VERIFIED SYSTEM-MANAGED REFERENCE: account-level "
+          f"call conversion action {action_resource} does not enumerate "
+          "through the conversion_action report for this customer, which "
+          "is consistent with a Google system-managed reference. Its "
+          "literal identity is UNKNOWN. Live ad-call attribution was "
+          "verified independently instead via "
+          f"\"{corroboration['name']}\" ({corroboration['resource_name']}), "
+          f"{corroboration['all_conversions']:g} conversions in the last 30 "
+          "days. Proceeding on that evidence, not on the reference itself."
+      )
+    else:
+      issues.append(
+          f"Account-level call conversion action {action_resource} does not "
+          "resolve to a conversion action in this customer, and no ENABLED "
+          "AD_CALL/CALL_FROM_ADS action with conversions in the last 30 "
+          "days could be found to corroborate that calls are still counted."
+      )
     return settings, issues
 
   if resolved["status"] != "ENABLED":
