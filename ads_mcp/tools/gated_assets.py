@@ -1791,17 +1791,18 @@ def _execute_detach_call_asset_from_campaign(
   after_by_resource = {l["resource_name"]: l for l in verified}
 
   # Half one of the approved operation: the target must actually be gone.
-  # Absent or REMOVED both count; anything still serving or merely paused
-  # means the remove did not take.
-  still_linked = after_by_resource.get(link_resource_name)
-  if (
-      still_linked is not None
-      and still_linked["status"] in _ACTIVE_LINK_STATUSES
-  ):
+  # Assert the success condition positively -- absent, or present with
+  # status exactly REMOVED. Testing for "not ENABLED and not PAUSED"
+  # instead would infer success from an unrecognised status (UNKNOWN,
+  # UNSPECIFIED, or any status Google adds later), which is precisely the
+  # kind of silent pass this gate exists to prevent. Fail closed.
+  after_target = after_by_resource.get(link_resource_name)
+  if after_target is not None and after_target["status"] != "REMOVED":
     raise ToolError(
-        "Post-apply verification failed: "
-        f"{link_resource_name} still reads back as an active link "
-        f"(status {still_linked['status']})."
+        "Post-apply verification failed: approved target "
+        f"{link_resource_name} still exists with unexpected status "
+        f"{after_target['status']}; expected absent or REMOVED. No "
+        "automatic remediation was performed."
     )
 
   # Half two: the approved SERVING replacement state must still hold in the

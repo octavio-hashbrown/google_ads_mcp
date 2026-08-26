@@ -1431,6 +1431,7 @@ def test_detach_executor_removes_verifies_and_keeps_the_asset():
 
 
 def test_detach_executor_fails_when_link_still_reads_back():
+  """The remove reported success but the link is unchanged afterwards."""
   before = [
       _link_row(resource_name=LINK),
       _link_row(resource_name=OTHER_LINK, phone="9144404316"),
@@ -1440,7 +1441,9 @@ def test_detach_executor_fails_when_link_still_reads_back():
     gated_assets._execute_detach_call_asset_from_campaign(
         client, "123", _detach_spec()
     )
-  assert "still reads back" in str(excinfo.value)
+  message = str(excinfo.value)
+  assert "still exists with unexpected status ENABLED" in message
+  assert "expected absent or REMOVED" in message
 
 
 # --- detach idempotency / stale proposal ----------------------------------
@@ -1959,9 +1962,17 @@ def test_post_apply_fails_when_approved_replacement_edited_afterwards(
   _assert_incident(excinfo, services)
 
 
-@pytest.mark.parametrize("lingering", ["ENABLED", "PAUSED"])
-def test_post_apply_fails_when_target_still_active_afterwards(lingering):
-  """The remove did not take. Still a failure, and not the incident path."""
+@pytest.mark.parametrize(
+    "lingering", ["ENABLED", "PAUSED", "UNKNOWN", "UNSPECIFIED"]
+)
+def test_post_apply_fails_when_target_is_not_absent_or_removed(lingering):
+  """Success is asserted positively: absent, or present and REMOVED.
+
+  ENABLED and PAUSED are the obvious cases. UNKNOWN and UNSPECIFIED are the
+  point: a check written as "not ENABLED and not PAUSED" would infer
+  success from a status it does not recognise, including any status Google
+  adds later. Fail closed instead.
+  """
   after = [
       _link_row(resource_name=LINK, phone="9174404316", status=lingering),
       _link_row(resource_name=OTHER_LINK, phone="9144404316"),
@@ -1972,8 +1983,10 @@ def test_post_apply_fails_when_target_still_active_afterwards(lingering):
         client, "123", _detach_spec(phone="9174404316")
     )
   message = str(excinfo.value)
-  assert "still reads back as an active link" in message
+  assert "still exists with unexpected status" in message
   assert f"status {lingering}" in message
+  assert "expected absent or REMOVED" in message
+  assert "No automatic remediation was performed" in message
 
 
 def test_post_apply_succeeds_when_target_reads_back_removed():
