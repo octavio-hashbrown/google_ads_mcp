@@ -734,6 +734,39 @@ def list_call_assets(
 # -----------------------------------------------------------------------------
 
 
+def _mutate_with_preflight(
+    service, method_name: str, customer_id: str, operation
+):
+  """Validates the EXACT operation server-side, then commits it.
+
+  The first pass sends validate_only=True. Google fully validates the
+  operation -- permissions, resource existence, field constraints -- and
+  writes nothing, so a malformed or unauthorised mutation fails before
+  anything is committed. Zero live delta from that pass.
+
+  Only if it is accepted does the identical operation run for real. The
+  asset paths previously committed with no dry run at all, unlike the ad
+  copy and migration paths.
+  """
+  mutate = getattr(service, method_name)
+  try:
+    mutate(
+        customer_id=customer_id,
+        operations=[operation],
+        validate_only=True,
+    )
+  except GoogleAdsException as e:
+    _handle_google_ads_error(e)
+  try:
+    return mutate(
+        customer_id=customer_id,
+        operations=[operation],
+        validate_only=False,
+    )
+  except GoogleAdsException as e:
+    _handle_google_ads_error(e)
+
+
 def build_call_asset_operation(phone_number: str, country_code: str):
   """Builds the AssetOperation that CREATES a CALL asset."""
   asset = resource_types.Asset()
@@ -766,6 +799,17 @@ def build_campaign_asset_operation(
       status=enum_types.AssetLinkStatusEnum.AssetLinkStatus.ENABLED,
   )
   return service_types.CampaignAssetOperation(create=campaign_asset)
+
+
+def build_campaign_asset_remove_operation(link_resource_name: str):
+  """Builds the CampaignAssetOperation that DETACHES a CALL asset link.
+
+  Removes the campaign<->asset LINK only. The underlying Asset resource
+  is never touched, because assets are account-level and are frequently
+  shared with other live campaigns. Detaching is therefore reversible by
+  re-linking the same asset.
+  """
+  return service_types.CampaignAssetOperation(remove=link_resource_name)
 
 
 # -----------------------------------------------------------------------------
@@ -1166,12 +1210,9 @@ def _create_call_asset(
   """Creates a CALL asset and returns its resource name."""
   service = ads_client.get_service("AssetService")
   operation = build_call_asset_operation(phone_number, country_code)
-  try:
-    response = service.mutate_assets(
-        customer_id=customer_id, operations=[operation]
-    )
-  except GoogleAdsException as e:
-    _handle_google_ads_error(e)
+  response = _mutate_with_preflight(
+      service, "mutate_assets", customer_id, operation
+  )
   return response.results[0].resource_name
 
 
@@ -1265,12 +1306,9 @@ def _execute_attach_call_asset(
   operation = build_ad_group_asset_operation(
       ad_group_resource_name, asset_resource_name
   )
-  try:
-    response = service.mutate_ad_group_assets(
-        customer_id=customer_id, operations=[operation]
-    )
-  except GoogleAdsException as e:
-    _handle_google_ads_error(e)
+  response = _mutate_with_preflight(
+      service, "mutate_ad_group_assets", customer_id, operation
+  )
   link_resource_name = response.results[0].resource_name
 
   verified = _find_ad_group_call_links(
@@ -1332,12 +1370,9 @@ def _execute_attach_call_asset_to_campaign(
   operation = build_campaign_asset_operation(
       campaign_resource_name, asset_resource_name
   )
-  try:
-    response = service.mutate_campaign_assets(
-        customer_id=customer_id, operations=[operation]
-    )
-  except GoogleAdsException as e:
-    _handle_google_ads_error(e)
+  response = _mutate_with_preflight(
+      service, "mutate_campaign_assets", customer_id, operation
+  )
   link_resource_name = response.results[0].resource_name
 
   verified = _find_campaign_call_links(
@@ -1369,4 +1404,206 @@ mutations_gated.register_executor(
 )
 mutations_gated.register_executor(
     "attach_call_asset_to_campaign", _execute_attach_call_asset_to_campaign
+)
+
+
+# -----------------------------------------------------------------------------
+# Propose / apply — campaign-level DETACH
+# -----------------------------------------------------------------------------
+
+
+@mcp.tool()
+def propose_detach_call_asset_from_campaign(
+    customer_id: str,
+    campaign_resource_name: str,
+    phone_number: str,
+    country_code: str,
+    reason_code: str,
+    reason_detail: str | None = None,
+    client_root: str | None = None,
+    client_label: str | None = None,
+    login_customer_id: str | None = None,
+) -> dict[str, str]:
+  """Proposes DETACHING a CALL asset link from a CAMPAIGN.
+
+  Removes the campaign-to-asset LINK only. The Asset resource itself is
+  never deleted, because call assets are account-level and are commonly
+  shared with other live campaigns, so detaching here cannot disturb
+  them. Re-linking the same asset restores the prior state exactly.
+
+  Refuses when the detach would leave the campaign with NO remaining
+  active CALL asset. A campaign that was advertising a phone number and
+  then silently advertises none is a worse state than the one being
+  corrected, so the replacement must be attached and verified first.
+
+  Args:
+      customer_id: Google Ads customer ID (digits only).
+      campaign_resource_name: Full resource name of the target campaign.
+      phone_number: Number whose link should be removed. Formatting is
+          ignored for matching purposes.
+      country_code: Two-letter country code, e.g. "US".
+%s
+      login_customer_id: MCC account ID if customer is managed.
+  """
+  audit.validate_reason(reason_code, reason_detail)
+  root = audit.resolve_client_root(client_root)
+  ads_client = _get_client(login_customer_id)
+
+  campaign_name = mutations_gated._gaql_lookup_campaign(  # pylint: disable=protected-access
+      ads_client, customer_id, campaign_resource_name
+  )
+  links = _find_campaign_call_links(
+      ads_client, customer_id, campaign_resource_name
+  )
+  target = _existing_link_for_number(links, phone_number, country_code)
+  if target is None:
+    raise ToolError(
+        f"No active CALL asset carrying {phone_number} ({country_code}) is "
+        f'linked to "{campaign_name}". Nothing to detach.'
+    )
+
+  remaining = [
+      l
+      for l in links
+      if l["resource_name"] != target["resource_name"]
+      and l["status"] in _ACTIVE_LINK_STATUSES
+  ]
+  if not remaining:
+    raise ToolError(
+        "STOPPING FOR APPROVAL. Detaching "
+        f"{target['phone_number']} would leave \"{campaign_name}\" with no "
+        "active CALL asset at all, so the campaign would advertise no "
+        "phone number. Attach the replacement number first, verify it "
+        "live, then re-propose this detach."
+    )
+
+  human_lines = [
+      f'Campaign "{campaign_name}"',
+      (
+          f"Detach CALL asset link {target['resource_name']} "
+          f"({target['phone_number']} / {target['country_code']}, status "
+          f"{target['status']})."
+      ),
+      (
+          "The asset resource itself is NOT deleted, only this campaign's "
+          "link to it. Other campaigns using the same asset are unaffected."
+      ),
+      (
+          "Remaining active CALL asset(s) on this campaign afterwards: "
+          + ", ".join(
+              f"{l['phone_number']} [{l['status']}]" for l in remaining
+          )
+      ),
+  ]
+
+  spec = {
+      "op": "detach_call_asset_from_campaign",
+      "campaign_resource_name": campaign_resource_name,
+      "campaign_asset_resource_name": target["resource_name"],
+      "asset_resource_name": target["asset"],
+      "phone_number": phone_number,
+      "country_code": country_code.upper(),
+      "expected_remaining_active_links": [
+          l["resource_name"] for l in remaining
+      ],
+      "login_customer_id": login_customer_id,
+  }
+
+  return approval.write_proposal(
+      root,
+      tool_name="detach_call_asset_from_campaign",
+      customer_id=customer_id,
+      operations_human=human_lines,
+      reason_code=reason_code,
+      reason_detail=reason_detail,
+      spec=spec,
+      client_label=client_label,
+  )
+
+
+propose_detach_call_asset_from_campaign.__doc__ = (
+    propose_detach_call_asset_from_campaign.__doc__
+    % mutations_gated._common_propose_args_doc()  # pylint: disable=protected-access
+)
+
+
+def _execute_detach_call_asset_from_campaign(
+    ads_client, customer_id: str, spec: dict[str, Any]
+) -> dict[str, Any]:
+  """Applies an approved CAMPAIGN-level detach."""
+  campaign_resource_name = spec["campaign_resource_name"]
+  link_resource_name = spec["campaign_asset_resource_name"]
+
+  links = _find_campaign_call_links(
+      ads_client, customer_id, campaign_resource_name
+  )
+  target = next(
+      (l for l in links if l["resource_name"] == link_resource_name), None
+  )
+  if target is None:
+    return {
+        "outcome": "no_op",
+        "detail": "That link no longer exists; nothing to detach.",
+        "campaign_asset": link_resource_name,
+    }
+
+  # The "never strand the campaign" guard is re-checked at apply, not
+  # merely trusted from propose time.
+  remaining = [
+      l
+      for l in links
+      if l["resource_name"] != link_resource_name
+      and l["status"] in _ACTIVE_LINK_STATUSES
+  ]
+  if not remaining:
+    raise ToolError(
+        "Refusing to apply: detaching this link would now leave the "
+        "campaign with no active CALL asset. The replacement that "
+        "justified this proposal is no longer present."
+    )
+
+  service = ads_client.get_service("CampaignAssetService")
+  operation = build_campaign_asset_remove_operation(link_resource_name)
+  _mutate_with_preflight(
+      service, "mutate_campaign_assets", customer_id, operation
+  )
+
+  verified = _find_campaign_call_links(
+      ads_client, customer_id, campaign_resource_name
+  )
+  still_linked = next(
+      (
+          l
+          for l in verified
+          if l["resource_name"] == link_resource_name
+          and l["status"] in _ACTIVE_LINK_STATUSES
+      ),
+      None,
+  )
+  if still_linked is not None:
+    raise ToolError(
+        "Post-apply verification failed: "
+        f"{link_resource_name} still reads back as an active link."
+    )
+
+  return {
+      "outcome": "applied",
+      "level": "campaign",
+      "detached_campaign_asset": link_resource_name,
+      "asset": spec.get("asset_resource_name"),
+      "asset_deleted": False,
+      "remaining_active_links": [
+          {
+              "resource_name": l["resource_name"],
+              "phone_number": l["phone_number"],
+          }
+          for l in verified
+          if l["status"] in _ACTIVE_LINK_STATUSES
+      ],
+      "verified_by": "GAQL read-back of campaign_asset",
+  }
+
+
+mutations_gated.register_executor(
+    "detach_call_asset_from_campaign", _execute_detach_call_asset_from_campaign
 )

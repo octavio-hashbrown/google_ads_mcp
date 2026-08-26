@@ -11,6 +11,7 @@ from unittest import mock
 from ads_mcp.tools import gated_assets
 from ads_mcp.tools import mutations_gated
 from fastmcp.exceptions import ToolError
+from google.ads.googleads.errors import GoogleAdsException
 import pytest
 
 
@@ -1249,3 +1250,158 @@ def test_apply_path_revalidates_live_and_demands_the_recorded_exception():
   kwargs = verifier.call_args.kwargs
   assert kwargs["require_recorded_exception"] is True
   assert kwargs["accepted_unenumerable_account_reference"] == ACCOUNT_ACTION
+# validate_only pre-flight on the asset services
+#
+# The asset paths previously committed with no dry run at all. Every one of
+# them must now validate the EXACT operation server-side first, and must not
+# commit if that validation fails.
+# ---------------------------------------------------------------------------
+
+
+ASSET_METHODS = [
+    "mutate_assets",
+    "mutate_campaign_assets",
+    "mutate_ad_group_assets",
+]
+
+
+@pytest.mark.parametrize("method", ASSET_METHODS)
+def test_preflight_validates_then_commits_the_same_operation(method):
+  service = mock.Mock()
+  operation = object()
+  gated_assets._mutate_with_preflight(service, method, "123", operation)
+
+  calls = getattr(service, method).call_args_list
+  assert len(calls) == 2
+  assert calls[0].kwargs["validate_only"] is True
+  assert calls[1].kwargs["validate_only"] is False
+  # The dry run must exercise the identical operation, or it proves nothing.
+  assert calls[0].kwargs["operations"] == [operation]
+  assert calls[1].kwargs["operations"] == [operation]
+  assert calls[0].kwargs["customer_id"] == "123"
+
+
+@pytest.mark.parametrize("method", ASSET_METHODS)
+def test_failed_validation_never_commits_zero_live_delta(method):
+  """Invalid resource/link must fail validation and write nothing."""
+  service = mock.Mock()
+  getattr(service, method).side_effect = GoogleAdsException(
+      None, None, None, None
+  )
+  with mock.patch.object(
+      gated_assets, "_handle_google_ads_error", side_effect=ToolError("invalid")
+  ):
+    with pytest.raises(ToolError):
+      gated_assets._mutate_with_preflight(service, method, "123", object())
+
+  calls = getattr(service, method).call_args_list
+  assert len(calls) == 1, "the real mutate must never run after a failed dry run"
+  assert calls[0].kwargs["validate_only"] is True
+
+
+def test_create_call_asset_uses_preflight():
+  service = mock.Mock()
+  service.mutate_assets.return_value = _mutate_result(ASSET)
+  client, _ = _client([])
+  client.get_service.side_effect = lambda n: service
+  assert gated_assets._create_call_asset(client, "123", "2017466577", "US") == ASSET
+  assert service.mutate_assets.call_args_list[0].kwargs["validate_only"] is True
+
+
+# ---------------------------------------------------------------------------
+# Governed campaign-asset DETACH
+# ---------------------------------------------------------------------------
+
+
+LINK = "customers/123/campaignAssets/789~309260824477~CALL"
+
+
+def test_campaign_asset_remove_operation_targets_the_link_only():
+  operation = gated_assets.build_campaign_asset_remove_operation(LINK)
+  assert operation.remove == LINK
+
+
+def test_campaign_asset_remove_runs_through_preflight():
+  service = mock.Mock()
+  operation = gated_assets.build_campaign_asset_remove_operation(LINK)
+  gated_assets._mutate_with_preflight(
+      service, "mutate_campaign_assets", "123", operation
+  )
+  calls = service.mutate_campaign_assets.call_args_list
+  assert len(calls) == 2
+  assert calls[0].kwargs["validate_only"] is True
+  assert calls[1].kwargs["validate_only"] is False
+  assert calls[0].kwargs["operations"][0].remove == LINK
+
+
+OTHER_LINK = "customers/123/campaignAssets/789~999~CALL"
+
+
+def _detach_spec(link=LINK):
+  return {
+      "campaign_resource_name": CAMPAIGN,
+      "campaign_asset_resource_name": link,
+      "asset_resource_name": ASSET,
+      "phone_number": "2017466577",
+      "country_code": "US",
+  }
+
+
+def test_detach_registered_in_shared_gate():
+  assert "detach_call_asset_from_campaign" in mutations_gated._DISPATCH
+
+
+def test_detach_executor_no_ops_when_link_already_gone():
+  client, _ = _client([[]])
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec()
+  )
+  assert out["outcome"] == "no_op"
+
+
+def test_detach_executor_refuses_to_strand_the_campaign():
+  """Approved or not: never leave a campaign with zero call assets."""
+  client, _ = _client([[_link_row(resource_name=LINK)]])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec()
+    )
+  assert "no active CALL asset" in str(excinfo.value)
+
+
+def test_detach_executor_removes_verifies_and_keeps_the_asset():
+  before = [
+      _link_row(resource_name=LINK),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+  ]
+  after = [_link_row(resource_name=OTHER_LINK, phone="9144404316")]
+  client, services = _client([before, after])
+
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec()
+  )
+  assert out["outcome"] == "applied"
+  assert out["detached_campaign_asset"] == LINK
+  assert out["asset_deleted"] is False
+  assert out["remaining_active_links"][0]["phone_number"] == "9144404316"
+
+  calls = services[
+      "CampaignAssetService"
+  ].mutate_campaign_assets.call_args_list
+  assert len(calls) == 2
+  assert calls[0].kwargs["validate_only"] is True
+  assert calls[1].kwargs["validate_only"] is False
+  assert calls[0].kwargs["operations"][0].remove == LINK
+
+
+def test_detach_executor_fails_when_link_still_reads_back():
+  before = [
+      _link_row(resource_name=LINK),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+  ]
+  client, _ = _client([before, before])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec()
+    )
+  assert "still reads back" in str(excinfo.value)
