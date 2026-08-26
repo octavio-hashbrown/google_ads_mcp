@@ -1405,3 +1405,39 @@ def test_detach_executor_fails_when_link_still_reads_back():
         client, "123", _detach_spec()
     )
   assert "still reads back" in str(excinfo.value)
+
+
+# --- detach idempotency / stale proposal ----------------------------------
+
+
+def test_detach_no_ops_when_intended_link_absent_but_others_exist():
+  """A different current state is NOT equivalent to the approved one."""
+  client, services = _client([
+      [_link_row(resource_name=OTHER_LINK, phone="9144404316")]
+  ])
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec(LINK)
+  )
+  assert out["outcome"] == "no_op"
+  assert out["campaign_asset"] == LINK
+  services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()
+
+
+def test_detach_never_removes_a_different_link_carrying_the_same_number():
+  """Stale proposal: the number is still linked, but via a NEW link id.
+
+  Matching on the phone number here would silently detach a link nobody
+  approved. The approved resource name is the only thing that counts.
+  """
+  recreated = "customers/123/campaignAssets/789~555~CALL"
+  client, services = _client([
+      [
+          _link_row(resource_name=recreated, phone="2017466577"),
+          _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+      ]
+  ])
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec(LINK)
+  )
+  assert out["outcome"] == "no_op"
+  services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()
