@@ -354,67 +354,132 @@ def test_account_action_drift_is_flagged():
 # ---------------------------------------------------------------------------
 
 
-def _corroboration_row(
-    resource_name="customers/123/conversionActions/6734917828",
-    name="Calls from ads",
-    type_="AD_CALL",
-    origin="CALL_FROM_ADS",
-    status="ENABLED",
-    all_conversions=26.0,
-):
+OTHER_ACTION = "customers/123/conversionActions/6734917828"
+
+
+def _ad_call_action_row(resource_name=ACCOUNT_ACTION, name="Calls from ads"):
+  """A row from the ENABLED AD_CALL / CALL_FROM_ADS lookup."""
   return types.SimpleNamespace(
       conversion_action=types.SimpleNamespace(
-          resource_name=resource_name,
-          id=6734917828,
-          name=name,
-          status=types.SimpleNamespace(name=status),
-          type_=types.SimpleNamespace(name=type_),
-          origin=types.SimpleNamespace(name=origin),
-      ),
-      metrics=types.SimpleNamespace(all_conversions=all_conversions),
+          resource_name=resource_name, name=name
+      )
   )
 
 
-def test_unresolvable_action_with_live_ad_call_warns_not_blocks():
-  """Cop Call NY shape: reference will not enumerate, calls demonstrably count."""
+def _asset_conv_row(
+    asset=ASSET,
+    reporting_state=ACCOUNT_LEVEL,
+    action=ACCOUNT_ACTION,
+    all_conversions=3.0,
+    level="campaign_asset",
+):
+  """A CALL asset LINK carrying conversions segmented to an action."""
+  row = types.SimpleNamespace(
+      asset=types.SimpleNamespace(
+          call_asset=types.SimpleNamespace(
+              call_conversion_reporting_state=types.SimpleNamespace(
+                  name=reporting_state
+              )
+          )
+      ),
+      segments=types.SimpleNamespace(conversion_action=action),
+      metrics=types.SimpleNamespace(all_conversions=all_conversions),
+  )
+  setattr(row, level, types.SimpleNamespace(asset=asset))
+  return row
+
+
+def test_unresolvable_action_with_account_level_asset_conversions_warns():
+  """Cop Call NY shape: the ACCOUNT-LEVEL path itself is proven live."""
   client, _ = _client([
       [_settings_row()],  # account settings healthy
       [],  # account-level reference does not resolve
-      [_corroboration_row()],  # but AD_CALL/CALL_FROM_ADS is counting
+      [_ad_call_action_row()],  # an ENABLED AD_CALL action exists
+      [_asset_conv_row()],  # and an ACCOUNT-LEVEL asset carries its conversions
   ])
   settings, issues = gated_assets.verify_account_call_reporting(client, "123")
   assert issues == []
+  assert settings["system_managed_reference"] == ACCOUNT_ACTION
   assert any(
       "ACCEPTED WITH VERIFIED SYSTEM-MANAGED REFERENCE" in w
       for w in settings["warnings"]
   )
-  assert any("Calls from ads" in w for w in settings["warnings"])
   assert any("UNKNOWN" in w for w in settings["warnings"])
+  assert any("USE_ACCOUNT_LEVEL" in w for w in settings["warnings"])
 
 
-def test_unresolvable_action_with_no_ad_call_action_blocks():
-  """No corroborating evidence at all -> still a hard failure."""
-  client, _ = _client([[_settings_row()], [], []])
-  _, issues = gated_assets.verify_account_call_reporting(client, "123")
-  assert any("does not" in i and "resolve" in i for i in issues)
+def test_unrelated_converting_ad_call_action_does_not_corroborate():
+  """The reviewer's explicit failure case.
 
-
-def test_unresolvable_action_with_zero_conversion_ad_call_blocks():
-  """An AD_CALL action that exists but counts nothing is not evidence."""
+  A DIFFERENT healthy AD_CALL action is converting, but nothing ties those
+  conversions to any asset using the account-level call-conversion setting.
+  "Some call action works" must NOT equal "the account-level reference is
+  corroborated".
+  """
   client, _ = _client([
       [_settings_row()],
       [],
-      [_corroboration_row(all_conversions=0.0)],
+      [_ad_call_action_row(resource_name=OTHER_ACTION)],
+      [],  # no campaign-level account-level asset carries them
+      [],  # no ad-group-level one either
+  ])
+  settings, issues = gated_assets.verify_account_call_reporting(client, "123")
+  assert any("account-level path is therefore unproven" in i for i in issues)
+  assert "warnings" not in settings
+  assert "system_managed_reference" not in settings
+
+
+def test_resource_level_asset_conversions_do_not_corroborate():
+  """An asset that counts calls via its OWN action proves nothing here."""
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row(reporting_state=RESOURCE_LEVEL)],
+      [],
   ])
   _, issues = gated_assets.verify_account_call_reporting(client, "123")
-  assert any("corroborate" in i for i in issues)
+  assert any("account-level path is therefore unproven" in i for i in issues)
+
+
+def test_zero_conversion_account_level_asset_does_not_corroborate():
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row(all_conversions=0.0)],
+      [],
+  ])
+  _, issues = gated_assets.verify_account_call_reporting(client, "123")
+  assert any("account-level path is therefore unproven" in i for i in issues)
+
+
+def test_no_enabled_ad_call_actions_blocks():
+  client, _ = _client([[_settings_row()], [], []])
+  _, issues = gated_assets.verify_account_call_reporting(client, "123")
+  assert any("account-level path is therefore unproven" in i for i in issues)
+
+
+def test_ad_group_level_asset_can_corroborate():
+  """Corroboration walks ad-group links too, not only campaign links."""
+  client, _ = _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [],  # nothing at campaign level
+      [_asset_conv_row(level="ad_group_asset")],
+  ])
+  settings, issues = gated_assets.verify_account_call_reporting(client, "123")
+  assert issues == []
+  assert settings["system_managed_reference"] == ACCOUNT_ACTION
 
 
 def test_reporting_disabled_is_never_bypassed_by_corroboration():
   client, _ = _client([
       [_settings_row(reporting=False)],
       [],
-      [_corroboration_row()],
+      [_ad_call_action_row()],
+      [_asset_conv_row()],
   ])
   settings, issues = gated_assets.verify_account_call_reporting(client, "123")
   assert any("call reporting is DISABLED" in i for i in issues)
@@ -425,7 +490,8 @@ def test_conversion_reporting_disabled_is_never_bypassed_by_corroboration():
   client, _ = _client([
       [_settings_row(conversion_reporting=False)],
       [],
-      [_corroboration_row()],
+      [_ad_call_action_row()],
+      [_asset_conv_row()],
   ])
   settings, issues = gated_assets.verify_account_call_reporting(client, "123")
   assert any("CONVERSION reporting is DISABLED" in i for i in issues)
@@ -436,7 +502,8 @@ def test_action_drift_is_never_bypassed_by_corroboration():
   client, _ = _client([
       [_settings_row(action="customers/123/conversionActions/999")],
       [],
-      [_corroboration_row()],
+      [_ad_call_action_row()],
+      [_asset_conv_row()],
   ])
   settings, issues = gated_assets.verify_account_call_reporting(
       client, "123", ACCOUNT_ACTION
@@ -445,24 +512,71 @@ def test_action_drift_is_never_bypassed_by_corroboration():
   assert "warnings" not in settings
 
 
-def test_corroboration_query_cannot_be_satisfied_by_unrelated_conversions():
-  """Only ENABLED AD_CALL/CALL_FROM_ADS with recent conversions may corroborate.
-
-  Guards the reviewer's requirement that unrelated conversion activity
-  (form fills, website calls, imports) can never bypass a genuinely broken
-  account-level configuration.
-  """
+def test_corroboration_query_is_pinned_to_call_links_and_ad_call_actions():
+  """Guards the query itself so it can never be widened silently."""
   client, services = _client([
       [_settings_row()],
       [],
-      [_corroboration_row()],
+      [_ad_call_action_row()],
+      [_asset_conv_row()],
   ])
   gated_assets.verify_account_call_reporting(client, "123")
-  query = services["GoogleAdsService"].search.call_args_list[-1].kwargs["query"]
-  assert "conversion_action.status = 'ENABLED'" in query
-  assert "conversion_action.type = 'AD_CALL'" in query
-  assert "conversion_action.origin = 'CALL_FROM_ADS'" in query
-  assert "LAST_30_DAYS" in query
+  queries = [
+      c.kwargs["query"]
+      for c in services["GoogleAdsService"].search.call_args_list
+  ]
+  action_query = queries[2]
+  assert "conversion_action.status = 'ENABLED'" in action_query
+  assert "conversion_action.type = 'AD_CALL'" in action_query
+  assert "conversion_action.origin = 'CALL_FROM_ADS'" in action_query
+  link_query = queries[3]
+  assert "FROM campaign_asset" in link_query
+  assert "campaign_asset.field_type = 'CALL'" in link_query
+  assert "asset.call_asset.call_conversion_reporting_state" in link_query
+  assert "segments.conversion_action IN" in link_query
+  assert "LAST_30_DAYS" in link_query
+
+
+# --- APPLY gate: corroboration alone is not enough ------------------------
+
+
+def _corroborated_client():
+  return _client([
+      [_settings_row()],
+      [],
+      [_ad_call_action_row()],
+      [_asset_conv_row()],
+  ])[0]
+
+
+def test_apply_blocks_when_no_exception_was_recorded():
+  _, issues = gated_assets.verify_account_call_reporting(
+      _corroborated_client(),
+      "123",
+      require_recorded_exception=True,
+  )
+  assert any("does not carry a matching" in i for i in issues)
+
+
+def test_apply_blocks_when_recorded_exception_is_for_another_reference():
+  _, issues = gated_assets.verify_account_call_reporting(
+      _corroborated_client(),
+      "123",
+      accepted_system_managed_reference="customers/123/conversionActions/999",
+      require_recorded_exception=True,
+  )
+  assert any("does not carry a matching" in i for i in issues)
+
+
+def test_apply_allows_when_matching_exception_was_recorded():
+  settings, issues = gated_assets.verify_account_call_reporting(
+      _corroborated_client(),
+      "123",
+      accepted_system_managed_reference=ACCOUNT_ACTION,
+      require_recorded_exception=True,
+  )
+  assert issues == []
+  assert settings["system_managed_reference"] == ACCOUNT_ACTION
 
 
 def test_account_action_not_ad_call_is_flagged():

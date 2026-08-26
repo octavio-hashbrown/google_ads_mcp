@@ -204,49 +204,91 @@ def _read_account_call_settings(
   raise ToolError(f"Could not read call reporting settings for {customer_id}.")
 
 
-def _find_live_ad_call_attribution(
-    ads_client, customer_id: str
-) -> dict[str, Any] | None:
-  """Finds an ENABLED AD_CALL/CALL_FROM_ADS action counting calls now.
-
-  This is deliberately narrow. It is the ONLY evidence accepted as
-  corroboration that an account-level call conversion action which the
-  API will not enumerate is nonetheless operative. Google can manage an
-  account-level call conversion action whose resource is not returned by
-  a `conversion_action` query scoped to the customer, while the AD_CALL
-  action it feeds is returned and is visibly counting.
-
-  Unrelated conversion activity does NOT qualify: the action must be
-  ENABLED, of type AD_CALL, with origin CALL_FROM_ADS, and must have
-  recorded conversions in the last 30 days. Form fills, website calls
-  and every other conversion type are ignored on purpose, because none
-  of them demonstrate that ad-call attribution is working.
-
-  Returns:
-      The corroborating action, or None if no such evidence exists.
-  """
+def _enabled_ad_call_actions(ads_client, customer_id: str) -> list[dict[str, str]]:
+  """Returns ENABLED AD_CALL / CALL_FROM_ADS conversion actions."""
   service = ads_client.get_service("GoogleAdsService")
   query = (
-      "SELECT conversion_action.resource_name, conversion_action.id, "
-      "conversion_action.name, conversion_action.status, "
-      "conversion_action.type, conversion_action.origin, "
-      "metrics.all_conversions "
+      "SELECT conversion_action.resource_name, conversion_action.name "
       "FROM conversion_action "
       "WHERE conversion_action.status = 'ENABLED' "
       "AND conversion_action.type = 'AD_CALL' "
       "AND conversion_action.origin = 'CALL_FROM_ADS' "
-      "AND segments.date DURING LAST_30_DAYS "
-      "LIMIT 10"
+      "LIMIT 20"
   )
   try:
     rows = service.search(customer_id=customer_id, query=query)
   except GoogleAdsException as e:
     _handle_google_ads_error(e)
-  for row in rows:
-    if row.metrics.all_conversions > 0:
-      return {
+  return [
+      {
           "resource_name": row.conversion_action.resource_name,
           "name": row.conversion_action.name,
+      }
+      for row in rows
+  ]
+
+
+def _find_account_level_call_attribution(
+    ads_client, customer_id: str
+) -> dict[str, Any] | None:
+  """Proves the ACCOUNT-LEVEL call path itself is carrying conversions.
+
+  The weaker question -- "does some AD_CALL action have conversions?" --
+  is NOT sufficient. A different, perfectly healthy AD_CALL action could
+  be converting while the configured account-level reference is genuinely
+  stale, and accepting that would let "some call action works" masquerade
+  as "the account-level reference is corroborated".
+
+  So this walks the link, not the action. It requires a CALL asset that
+  is itself configured for USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION --
+  i.e. an asset whose calls can only be counted through the account-level
+  reference -- and requires that asset link to carry conversions
+  segmented to an ENABLED AD_CALL/CALL_FROM_ADS action. That combination
+  cannot occur unless the account-level path is live.
+
+  Both campaign-level and ad-group-level links are checked.
+
+  Returns:
+      Evidence dict, or None when the tie cannot be demonstrated.
+  """
+  actions = _enabled_ad_call_actions(ads_client, customer_id)
+  if not actions:
+    return None
+
+  service = ads_client.get_service("GoogleAdsService")
+  in_list = ", ".join(f"'{a['resource_name']}'" for a in actions)
+  names = {a["resource_name"]: a["name"] for a in actions}
+
+  for resource, parent_field in (
+      ("campaign_asset", "campaign_asset.asset"),
+      ("ad_group_asset", "ad_group_asset.asset"),
+  ):
+    query = (
+        f"SELECT {parent_field}, "
+        "asset.call_asset.call_conversion_reporting_state, "
+        "segments.conversion_action, metrics.all_conversions "
+        f"FROM {resource} "
+        f"WHERE {resource}.field_type = 'CALL' "
+        "AND segments.date DURING LAST_30_DAYS "
+        f"AND segments.conversion_action IN ({in_list})"
+    )
+    try:
+      rows = service.search(customer_id=customer_id, query=query)
+    except GoogleAdsException as e:
+      _handle_google_ads_error(e)
+    for row in rows:
+      state = row.asset.call_asset.call_conversion_reporting_state.name
+      if state != "USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION":
+        continue
+      if row.metrics.all_conversions <= 0:
+        continue
+      action_resource = row.segments.conversion_action
+      return {
+          "level": resource,
+          "asset": getattr(row, resource).asset,
+          "reporting_state": state,
+          "action_resource": action_resource,
+          "action_name": names.get(action_resource, action_resource),
           "all_conversions": row.metrics.all_conversions,
       }
   return None
@@ -256,6 +298,9 @@ def verify_account_call_reporting(
     ads_client,
     customer_id: str,
     expected_call_conversion_action: str | None = None,
+    *,
+    accepted_system_managed_reference: str | None = None,
+    require_recorded_exception: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
   """Verifies account-level call reporting is intact.
 
@@ -332,27 +377,51 @@ def verify_account_call_reporting(
         and settings["call_conversion_reporting_enabled"]
         and not issues
     ):
-      corroboration = _find_live_ad_call_attribution(ads_client, customer_id)
-
-    if corroboration:
-      settings.setdefault("warnings", []).append(
-          "ACCEPTED WITH VERIFIED SYSTEM-MANAGED REFERENCE: account-level "
-          f"call conversion action {action_resource} does not enumerate "
-          "through the conversion_action report for this customer, which "
-          "is consistent with a Google system-managed reference. Its "
-          "literal identity is UNKNOWN. Live ad-call attribution was "
-          "verified independently instead via "
-          f"\"{corroboration['name']}\" ({corroboration['resource_name']}), "
-          f"{corroboration['all_conversions']:g} conversions in the last 30 "
-          "days. Proceeding on that evidence, not on the reference itself."
+      corroboration = _find_account_level_call_attribution(
+          ads_client, customer_id
       )
-    else:
+
+    if not corroboration:
       issues.append(
           f"Account-level call conversion action {action_resource} does not "
-          "resolve to a conversion action in this customer, and no ENABLED "
-          "AD_CALL/CALL_FROM_ADS action with conversions in the last 30 "
-          "days could be found to corroborate that calls are still counted."
+          "resolve to a conversion action in this customer, and no CALL "
+          "asset configured for USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION "
+          "could be shown carrying AD_CALL/CALL_FROM_ADS conversions in the "
+          "last 30 days. The account-level path is therefore unproven."
       )
+      return settings, issues
+
+    # Corroborated. At PROPOSE this may proceed as a surfaced warning and
+    # the reference is handed back to be recorded in the proposal. At
+    # APPLY it is not enough on its own: the approved proposal must carry
+    # the same exception, so a human explicitly reviewed and accepted it.
+    if require_recorded_exception and (
+        accepted_system_managed_reference != action_resource
+    ):
+      issues.append(
+          "Refusing to apply under a system-managed account-level call "
+          f"conversion reference ({action_resource}): the approved "
+          "proposal does not carry a matching, explicitly accepted "
+          "system-managed-reference exception "
+          f"(recorded: {accepted_system_managed_reference or 'none'}). "
+          "Re-propose so the exception is reviewed and approved."
+      )
+      return settings, issues
+
+    settings["system_managed_reference"] = action_resource
+    settings.setdefault("warnings", []).append(
+        "ACCEPTED WITH VERIFIED SYSTEM-MANAGED REFERENCE: account-level "
+        f"call conversion action {action_resource} does not enumerate "
+        "through the conversion_action report for this customer, which is "
+        "consistent with a Google system-managed reference. Its literal "
+        "identity is UNKNOWN. The account-level path was proven live "
+        "instead: CALL asset "
+        f"{corroboration['asset']} ({corroboration['level']}) is configured "
+        "USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION and carried "
+        f"{corroboration['all_conversions']:g} conversions attributed to "
+        f"\"{corroboration['action_name']}\" "
+        f"({corroboration['action_resource']}) in the last 30 days."
+    )
     return settings, issues
 
   if resolved["status"] != "ENABLED":
@@ -838,7 +907,17 @@ def _prepare_attachment(
           existing_asset["resource_name"] if existing_asset else None
       ),
       "accepted_incompatibilities": blocking,
+      # Set ONLY when the account-level call conversion action could not
+      # be enumerated AND the account-level path was independently proven
+      # live. Apply refuses to tolerate that state unless this exact
+      # reference is carried here, so approving the proposal is what
+      # accepts the exception.
+      "accepted_system_managed_reference": account.get(
+          "system_managed_reference"
+      ),
   }
+  for warning in account.get("warnings", []):
+    human_lines.append(f"WARNING: {warning}")
   return human_lines, spec
 
 
@@ -1099,11 +1178,17 @@ def _resolve_asset_for_apply(
         + "\nRe-propose so the current configuration is reviewed."
     )
 
-  # Account-level attribution must also still hold.
+  # Account-level attribution must also still hold. At apply, a
+  # system-managed (unenumerable) reference is only tolerated when the
+  # approved proposal explicitly recorded that exception.
   _, account_issues = verify_account_call_reporting(
       ads_client,
       customer_id,
       spec.get("expected_account_call_conversion_action"),
+      accepted_system_managed_reference=spec.get(
+          "accepted_system_managed_reference"
+      ),
+      require_recorded_exception=True,
   )
   if account_issues:
     raise ToolError(
