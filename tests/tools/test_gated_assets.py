@@ -1337,13 +1337,37 @@ def test_campaign_asset_remove_runs_through_preflight():
 OTHER_LINK = "customers/123/campaignAssets/789~999~CALL"
 
 
-def _detach_spec(link=LINK):
+STRAY_LINK = "customers/123/campaignAssets/789~444555666~CALL"
+REPLACEMENT_ASSET = "customers/123/assets/914914914"
+
+
+def _remaining(
+    resource_name=OTHER_LINK,
+    asset=ASSET,
+    phone_number="9144404316",
+    country_code="US",
+):
+  """One entry of the approved post-detach state."""
+  return {
+      "resource_name": resource_name,
+      "asset": asset,
+      "phone_number": phone_number,
+      "country_code": country_code,
+  }
+
+
+def _detach_spec(
+    link=LINK, phone="2017466577", asset=ASSET, remaining=None
+):
   return {
       "campaign_resource_name": CAMPAIGN,
       "campaign_asset_resource_name": link,
-      "asset_resource_name": ASSET,
-      "phone_number": "2017466577",
+      "asset_resource_name": asset,
+      "phone_number": phone,
       "country_code": "US",
+      "expected_remaining_active_links": (
+          [_remaining()] if remaining is None else remaining
+      ),
   }
 
 
@@ -1360,13 +1384,19 @@ def test_detach_executor_no_ops_when_link_already_gone():
 
 
 def test_detach_executor_refuses_to_strand_the_campaign():
-  """Approved or not: never leave a campaign with zero call assets."""
+  """Never leave a campaign with zero call assets.
+
+  Propose refuses to record an empty approved-remaining set, so the
+  identity gate below subsumes the old non-empty check and is strictly
+  stronger: stranding the campaign now shows up as the approved
+  replacement having vanished.
+  """
   client, _ = _client([[_link_row(resource_name=LINK)]])
   with pytest.raises(ToolError) as excinfo:
     gated_assets._execute_detach_call_asset_from_campaign(
         client, "123", _detach_spec()
     )
-  assert "no active CALL asset" in str(excinfo.value)
+  assert "no longer an active CALL link" in str(excinfo.value)
 
 
 def test_detach_executor_removes_verifies_and_keeps_the_asset():
@@ -1440,4 +1470,151 @@ def test_detach_never_removes_a_different_link_carrying_the_same_number():
       client, "123", _detach_spec(LINK)
   )
   assert out["outcome"] == "no_op"
+  services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The approval covers the exact replacement state that was reviewed, not the
+# much weaker claim that some phone number will still be attached.
+# ---------------------------------------------------------------------------
+
+
+def test_detach_hard_fails_when_approved_replacement_gone_but_stray_remains():
+  """917 target, approved 914 replacement vanished, unrelated 201 present.
+
+  The old gate saw a non-empty remaining list and would have detached 917
+  against a state nobody approved.
+  """
+  before = [
+      _link_row(resource_name=LINK, phone="9174404316"),
+      _link_row(resource_name=STRAY_LINK, phone="2013452124"),
+  ]
+  client, services = _client([before])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec(phone="9174404316")
+    )
+
+  message = str(excinfo.value)
+  assert "no longer an active CALL link" in message
+  assert "9144404316" in message, "name the replacement that justified it"
+  assert "Re-propose" in message
+  services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()
+
+
+def test_detach_hard_fails_when_replacement_reappears_under_a_new_id():
+  """Same number, new resource ID, is still a different approved state."""
+  before = [
+      _link_row(resource_name=LINK, phone="9174404316"),
+      _link_row(
+          resource_name=STRAY_LINK,
+          phone="9144404316",
+          asset=REPLACEMENT_ASSET,
+      ),
+  ]
+  client, services = _client([before])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec(phone="9174404316")
+    )
+
+  assert "no longer an active CALL link" in str(excinfo.value)
+  services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()
+
+
+def test_detach_proceeds_when_approved_replacement_is_still_exactly_active():
+  """Control: the reviewed state is intact, so the detach may proceed."""
+  before = [
+      _link_row(resource_name=LINK, phone="9174404316"),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+  ]
+  after = [_link_row(resource_name=OTHER_LINK, phone="9144404316")]
+  client, services = _client([before, after])
+
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec(phone="9174404316")
+  )
+  assert out["outcome"] == "applied"
+  assert out["detached_campaign_asset"] == LINK
+  assert out["approved_remaining_links_reverified"] == [OTHER_LINK]
+  assert out["unapproved_additional_links_present_at_apply"] == []
+  services["CampaignAssetService"].mutate_campaign_assets.assert_called()
+
+
+def test_detach_no_ops_before_any_identity_check_when_target_already_gone():
+  """917 already detached by someone else: no-op, never touch another link."""
+  before = [
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+      _link_row(resource_name=STRAY_LINK, phone="2013452124"),
+  ]
+  client, services = _client([before])
+
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec(phone="9174404316")
+  )
+  assert out["outcome"] == "no_op"
+  assert out["campaign_asset"] == LINK
+  services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()
+
+
+def test_detach_allows_a_superset_but_surfaces_the_unapproved_link():
+  """A number attached since approval cannot strand the campaign.
+
+  It is not what is being removed and it cannot make the outcome unsafe,
+  so it does not force a re-proposal -- but it IS drift, so it is recorded
+  in the applied result rather than passed over in silence.
+  """
+  before = [
+      _link_row(resource_name=LINK, phone="9174404316"),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+      _link_row(resource_name=STRAY_LINK, phone="2013452124"),
+  ]
+  after = [
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+      _link_row(resource_name=STRAY_LINK, phone="2013452124"),
+  ]
+  client, _ = _client([before, after])
+
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec(phone="9174404316")
+  )
+  assert out["outcome"] == "applied"
+  assert out["approved_remaining_links_reverified"] == [OTHER_LINK]
+  assert out["unapproved_additional_links_present_at_apply"] == [STRAY_LINK]
+
+
+def test_detach_hard_fails_when_the_target_asset_was_edited_after_approval():
+  """Same link, number swapped underneath it.
+
+  Asset phone numbers are editable in place, so a link approved for
+  removal because it carried 917 can be carrying 914 by apply time.
+  Removing it then destroys a good number under a stale approval.
+  """
+  before = [
+      _link_row(resource_name=LINK, phone="9144404316"),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+  ]
+  client, services = _client([before])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec(phone="9174404316")
+    )
+
+  assert "now carries" in str(excinfo.value)
+  services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()
+
+
+def test_detach_refuses_a_proposal_without_recorded_remaining_identities():
+  """A spec that cannot prove the approved state must never apply."""
+  spec = _detach_spec()
+  spec["expected_remaining_active_links"] = [OTHER_LINK]  # legacy bare names
+  before = [
+      _link_row(resource_name=LINK),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+  ]
+  client, services = _client([before])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(client, "123", spec)
+
+  assert "full identities" in str(excinfo.value)
   services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()

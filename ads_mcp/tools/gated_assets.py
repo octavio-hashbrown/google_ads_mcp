@@ -1436,6 +1436,14 @@ def propose_detach_call_asset_from_campaign(
   then silently advertises none is a worse state than the one being
   corrected, so the replacement must be attached and verified first.
 
+  The proposal records the full identity of every CALL link expected to
+  survive the detach. Apply re-verifies that exact set: the approval
+  covers the specific replacement state a human reviewed, not the much
+  weaker claim that some phone number will still be attached. If the
+  replacement that justified the approval is gone, or has been edited
+  to carry a different number, apply hard-fails and the change must be
+  re-proposed rather than silently executed against different state.
+
   Args:
       customer_id: Google Ads customer ID (digits only).
       campaign_resource_name: Full resource name of the target campaign.
@@ -1494,6 +1502,13 @@ def propose_detach_call_asset_from_campaign(
               f"{l['phone_number']} [{l['status']}]" for l in remaining
           )
       ),
+      (
+          "APPROVING THIS PROPOSAL APPROVES THAT EXACT REMAINING STATE. "
+          "If any of those links is gone, or no longer carries the same "
+          "asset and number, apply will refuse and this must be "
+          "re-proposed. A different phone number that happens to be "
+          "active at apply time is NOT an acceptable substitute."
+      ),
   ]
 
   spec = {
@@ -1503,8 +1518,17 @@ def propose_detach_call_asset_from_campaign(
       "asset_resource_name": target["asset"],
       "phone_number": phone_number,
       "country_code": country_code.upper(),
+      # Full identity, not bare resource names: apply has to be able to
+      # prove the approved replacement itself is still there, carrying
+      # the same asset and the same number.
       "expected_remaining_active_links": [
-          l["resource_name"] for l in remaining
+          {
+              "resource_name": l["resource_name"],
+              "asset": l["asset"],
+              "phone_number": l["phone_number"],
+              "country_code": l["country_code"],
+          }
+          for l in remaining
       ],
       "login_customer_id": login_customer_id,
   }
@@ -1547,20 +1571,73 @@ def _execute_detach_call_asset_from_campaign(
         "campaign_asset": link_resource_name,
     }
 
-  # The "never strand the campaign" guard is re-checked at apply, not
-  # merely trusted from propose time.
-  remaining = [
-      l
-      for l in links
-      if l["resource_name"] != link_resource_name
-      and l["status"] in _ACTIVE_LINK_STATUSES
-  ]
-  if not remaining:
+  # The target must still be the exact link that was approved. The
+  # resource name pins the campaign and the asset, but an asset's phone
+  # number can be edited in place -- same link, different number. Detaching
+  # on a stale number would remove a good number under an approval that
+  # was granted to remove a bad one.
+  if target["asset"] != spec["asset_resource_name"]:
     raise ToolError(
-        "Refusing to apply: detaching this link would now leave the "
-        "campaign with no active CALL asset. The replacement that "
-        "justified this proposal is no longer present."
+        "Refusing to apply: link "
+        f"{link_resource_name} now points at asset {target['asset']}, not "
+        f"the approved {spec['asset_resource_name']}. Re-propose."
     )
+  if not _same_number(target["phone_number"], spec["phone_number"]):
+    raise ToolError(
+        "Refusing to apply: link "
+        f"{link_resource_name} now carries {target['phone_number']}, not "
+        f"the approved {spec['phone_number']}. The asset was edited after "
+        "approval, so detaching it would remove a number nobody reviewed. "
+        "Re-propose."
+    )
+
+  # The approval covers ONE specific remaining state, not "some phone
+  # number will still be attached". Requiring merely a non-empty remaining
+  # list would let an unrelated number stand in for the replacement that
+  # actually justified the approval.
+  approved_remaining = spec.get("expected_remaining_active_links") or []
+  if not approved_remaining or not all(
+      isinstance(l, dict) for l in approved_remaining
+  ):
+    raise ToolError(
+        "Refusing to apply: this proposal does not record the approved "
+        "remaining CALL links as full identities, so the approved "
+        "replacement state cannot be re-verified. Re-propose."
+    )
+
+  current_active = {
+      l["resource_name"]: l
+      for l in links
+      if l["status"] in _ACTIVE_LINK_STATUSES
+  }
+  for approved in approved_remaining:
+    live = current_active.get(approved["resource_name"])
+    if live is None:
+      raise ToolError(
+          "Refusing to apply: the approved replacement link "
+          f"{approved['resource_name']} ({approved['phone_number']}) is no "
+          "longer an active CALL link on this campaign. The state that "
+          "justified this approval is gone -- a different active number is "
+          "NOT a substitute. Re-propose."
+      )
+    if live["asset"] != approved["asset"] or not _same_number(
+        live["phone_number"], approved["phone_number"]
+    ):
+      raise ToolError(
+          "Refusing to apply: the approved replacement link "
+          f"{approved['resource_name']} now carries "
+          f"{live['phone_number']} (asset {live['asset']}), not the "
+          f"approved {approved['phone_number']} (asset {approved['asset']}). "
+          "Re-propose."
+      )
+
+  # Links that appeared since approval are tolerated: they cannot strand
+  # the campaign and they are not what is being removed. They are surfaced
+  # in the result so the drift is still visible to whoever reads the audit.
+  unapproved = sorted(
+      set(current_active) - {a["resource_name"] for a in approved_remaining}
+      - {link_resource_name}
+  )
 
   service = ads_client.get_service("CampaignAssetService")
   operation = build_campaign_asset_remove_operation(link_resource_name)
@@ -1592,6 +1669,10 @@ def _execute_detach_call_asset_from_campaign(
       "detached_campaign_asset": link_resource_name,
       "asset": spec.get("asset_resource_name"),
       "asset_deleted": False,
+      "approved_remaining_links_reverified": [
+          a["resource_name"] for a in approved_remaining
+      ],
+      "unapproved_additional_links_present_at_apply": unapproved,
       "remaining_active_links": [
           {
               "resource_name": l["resource_name"],
