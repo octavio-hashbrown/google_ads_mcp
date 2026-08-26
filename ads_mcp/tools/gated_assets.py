@@ -1464,6 +1464,13 @@ def propose_detach_call_asset_from_campaign(
   country prefixes by design, so identical local digits under a
   different country are a different number.
 
+  Verification after the mutation checks BOTH halves of the approved
+  operation, not just the removal: the target must be absent or REMOVED,
+  AND every approved replacement must still read back ENABLED with the
+  same asset, number and country. A failure there is reported as a
+  post-apply incident rather than a successful apply, because the remove
+  has already happened at that point. Nothing is automatically remediated.
+
   Args:
       customer_id: Google Ads customer ID (digits only).
       campaign_resource_name: Full resource name of the target campaign.
@@ -1781,20 +1788,66 @@ def _execute_detach_call_asset_from_campaign(
   verified = _find_campaign_call_links(
       ads_client, customer_id, campaign_resource_name
   )
-  still_linked = next(
-      (
-          l
-          for l in verified
-          if l["resource_name"] == link_resource_name
-          and l["status"] in _ACTIVE_LINK_STATUSES
-      ),
-      None,
-  )
-  if still_linked is not None:
+  after_by_resource = {l["resource_name"]: l for l in verified}
+
+  # Half one of the approved operation: the target must actually be gone.
+  # Absent or REMOVED both count; anything still serving or merely paused
+  # means the remove did not take.
+  still_linked = after_by_resource.get(link_resource_name)
+  if (
+      still_linked is not None
+      and still_linked["status"] in _ACTIVE_LINK_STATUSES
+  ):
     raise ToolError(
         "Post-apply verification failed: "
-        f"{link_resource_name} still reads back as an active link."
+        f"{link_resource_name} still reads back as an active link "
+        f"(status {still_linked['status']})."
     )
+
+  # Half two: the approved SERVING replacement state must still hold in the
+  # fresh AFTER read. The pre-apply gate stops an unsafe mutation from being
+  # attempted; this stops us claiming a destination state that does not
+  # actually exist. The remove has already gone through by the time we get
+  # here, so a failure below is an incident to be reviewed, not a refusal.
+  for approved in approved_remaining:
+    live = after_by_resource.get(approved["resource_name"])
+    problem = None
+    if live is None:
+      problem = "is missing from the campaign"
+    elif live["status"] == "REMOVED":
+      problem = "reads back as REMOVED"
+    elif live["status"] not in _SERVING_CALL_LINK_STATUSES:
+      problem = f"reads back as {live['status']}, not ENABLED"
+    elif live["asset"] != approved["asset"]:
+      problem = (
+          f"now points at asset {live['asset']}, not the approved "
+          f"{approved['asset']}"
+      )
+    elif not _same_number(live["phone_number"], approved["phone_number"]):
+      problem = (
+          f"now carries {live['phone_number']}, not the approved "
+          f"{approved['phone_number']}"
+      )
+    elif live["country_code"].upper() != str(
+        approved.get("country_code", "")
+    ).upper():
+      problem = (
+          f"now carries country code {live['country_code']}, not the "
+          f"approved {approved.get('country_code')}"
+      )
+
+    if problem:
+      raise ToolError(
+          "POST-APPLY VERIFICATION FAILURE. The detach of "
+          f"{link_resource_name} ({spec['phone_number']}) WAS APPLIED, but "
+          "the approved serving replacement state does NOT verify in the "
+          "independent read-back afterwards: approved replacement "
+          f"{approved['resource_name']} ({approved['phone_number']}) "
+          f"{problem}. This campaign may now be advertising no reachable "
+          "phone number. NO AUTOMATIC REMEDIATION WAS PERFORMED -- nothing "
+          "has been reattached, repointed or re-enabled. Governed incident "
+          "review is required before any further change."
+      )
 
   return {
       "outcome": "applied",

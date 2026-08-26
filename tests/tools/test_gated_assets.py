@@ -1862,3 +1862,145 @@ def test_detach_refuses_a_spec_without_a_frozen_target_status():
       excinfo.value
   )
   services["CampaignAssetService"].mutate_campaign_assets.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AFTER verification. The pre-apply gate stops an unsafe mutation from being
+# attempted. This stops us claiming a destination state that does not exist.
+# The remove has already happened by the time these fire, so a failure here
+# is an incident report, not a refusal.
+# ---------------------------------------------------------------------------
+
+
+def _detach_before():
+  return [
+      _link_row(resource_name=LINK, phone="9174404316"),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+  ]
+
+
+def _assert_incident(excinfo, services):
+  """A post-apply failure must read as an incident, not a refusal."""
+  message = str(excinfo.value)
+  assert "POST-APPLY VERIFICATION FAILURE" in message
+  assert "WAS APPLIED" in message
+  assert "NO AUTOMATIC REMEDIATION WAS PERFORMED" in message
+  assert "Governed incident review is required" in message
+  # The mutation really did go through; that is why this is an incident.
+  services["CampaignAssetService"].mutate_campaign_assets.assert_called()
+
+
+def test_post_apply_fails_when_approved_replacement_missing_afterwards():
+  after = []
+  client, services = _client([_detach_before(), after])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec(phone="9174404316")
+    )
+  assert "is missing from the campaign" in str(excinfo.value)
+  _assert_incident(excinfo, services)
+
+
+def test_post_apply_fails_when_approved_replacement_removed_afterwards():
+  after = [
+      _link_row(resource_name=OTHER_LINK, phone="9144404316", status="REMOVED")
+  ]
+  client, services = _client([_detach_before(), after])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec(phone="9174404316")
+    )
+  assert "reads back as REMOVED" in str(excinfo.value)
+  _assert_incident(excinfo, services)
+
+
+def test_post_apply_fails_when_approved_replacement_paused_afterwards():
+  after = [
+      _link_row(resource_name=OTHER_LINK, phone="9144404316", status="PAUSED")
+  ]
+  client, services = _client([_detach_before(), after])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec(phone="9174404316")
+    )
+  assert "reads back as PAUSED, not ENABLED" in str(excinfo.value)
+  _assert_incident(excinfo, services)
+
+
+@pytest.mark.parametrize(
+    "after_row, expected",
+    [
+        (
+            {"asset": REPLACEMENT_ASSET},
+            "now points at asset",
+        ),
+        (
+            {"phone": "2013452124"},
+            "now carries 2013452124",
+        ),
+        (
+            {"country": "CA"},
+            "now carries country code CA",
+        ),
+    ],
+)
+def test_post_apply_fails_when_approved_replacement_edited_afterwards(
+    after_row, expected
+):
+  """Asset, number or country swapped underneath the approved link."""
+  kwargs = {"resource_name": OTHER_LINK, "phone": "9144404316"}
+  kwargs.update(after_row)
+  client, services = _client([_detach_before(), [_link_row(**kwargs)]])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec(phone="9174404316")
+    )
+  assert expected in str(excinfo.value)
+  _assert_incident(excinfo, services)
+
+
+@pytest.mark.parametrize("lingering", ["ENABLED", "PAUSED"])
+def test_post_apply_fails_when_target_still_active_afterwards(lingering):
+  """The remove did not take. Still a failure, and not the incident path."""
+  after = [
+      _link_row(resource_name=LINK, phone="9174404316", status=lingering),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+  ]
+  client, _ = _client([_detach_before(), after])
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._execute_detach_call_asset_from_campaign(
+        client, "123", _detach_spec(phone="9174404316")
+    )
+  message = str(excinfo.value)
+  assert "still reads back as an active link" in message
+  assert f"status {lingering}" in message
+
+
+def test_post_apply_succeeds_when_target_reads_back_removed():
+  """Target present but REMOVED, replacement intact. That is success."""
+  after = [
+      _link_row(resource_name=LINK, phone="9174404316", status="REMOVED"),
+      _link_row(resource_name=OTHER_LINK, phone="9144404316"),
+  ]
+  client, _ = _client([_detach_before(), after])
+
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec(phone="9174404316")
+  )
+  assert out["outcome"] == "applied"
+  assert out["approved_remaining_links_reverified"] == [OTHER_LINK]
+  assert [l["resource_name"] for l in out["remaining_serving_links"]] == [
+      OTHER_LINK
+  ]
+
+
+def test_post_apply_succeeds_when_target_absent_and_replacement_intact():
+  """Control: the normal happy path still returns applied."""
+  after = [_link_row(resource_name=OTHER_LINK, phone="9144404316")]
+  client, _ = _client([_detach_before(), after])
+
+  out = gated_assets._execute_detach_call_asset_from_campaign(
+      client, "123", _detach_spec(phone="9174404316")
+  )
+  assert out["outcome"] == "applied"
+  assert out["remaining_serving_links"][0]["status"] == "ENABLED"
