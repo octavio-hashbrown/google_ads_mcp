@@ -101,6 +101,9 @@ It proves a mutation *could* be submitted. It is never evidence that one
   (`propose_*` / `apply_*`) plus `validate_only_capability_check`.
 - `ADS_MCP_ENABLE_RAW_MUTATIONS=true` — additionally enables the **raw**
   immediate-execution tools. Requires the above. Defaults to false.
+- `ADS_MCP_PINNED_REVISION=<40-char commit>` — the exact revision this
+  deployment must be running. **Required whenever the governed tier is
+  enabled.** See *Pinned runtime* below.
 - `LO_AGENCY_CLIENT_ROOT=/path/to/client/folder` — default location for
   `pending_approvals/`, `applied_approvals/`, `rejected_approvals/`,
   and `client_audit_log.md`. Each `propose_*` / `apply_*` call may also
@@ -108,6 +111,47 @@ It proves a mutation *could* be submitted. It is never evidence that one
 
 The resolved posture is printed to stderr at startup, e.g.
 `[ads-mcp governance] GOVERNED ONLY -- propose/approve/apply; raw tools NOT exposed`.
+
+## Pinned runtime
+
+A proposal is only as trustworthy as the code that framed it, so the
+governed tier refuses to serve from a runtime that cannot prove which
+revision it is executing.
+
+**The defect this replaced.** The MCP was launched with
+`uv run --directory <developer working tree>`, so each instance imported
+whatever happened to be checked out when it spawned. On 2026-08-26 five
+concurrent sessions were found running four different revisions — one
+predating the governance work entirely — and nothing in a running process
+could report which revision it was. Answering "what is this session
+running?" required inspecting OS process tables against a git reflog.
+
+**How it works now.**
+
+- `ads_mcp/scripts/deploy_runtime.py` cuts a separate git worktree in
+  **detached HEAD** at one commit. Detached is the point: it follows no
+  branch, so ordinary development cannot move it.
+- The deployment writes a `RUNTIME_REVISION` stamp, so the process can
+  state its revision without shelling out to git.
+- `ADS_MCP_PINNED_REVISION` in the launch config states the revision the
+  operator intends. At **serve time** the entrypoint refuses to start if
+  the runtime is unpinned, unprovable, mismatched, or edited in place.
+  The check sits in `main()`, not at import: importing the module to
+  inspect the registry is legitimate; serving unverified is not.
+- `get_runtime_provenance` (READ tier) lets any session prove what it is
+  talking to. It is READ tier on purpose — provable revision must survive
+  every mutation tier being switched off.
+
+Read-only use may stay unpinned, so local development is unaffected. The
+governed tier may not.
+
+```bash
+uv run -m ads_mcp.scripts.deploy_runtime --revision origin/lo-media-mutations
+```
+
+The script prints the exact `~/.claude.json` block to use. Deployment
+takes effect on the next session spawn: a running MCP keeps the code it
+already imported.
 
 ## File layout
 

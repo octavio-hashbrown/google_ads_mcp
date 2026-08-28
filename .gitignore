@@ -26,3 +26,8 @@ google-ads.yaml
 # Test files
 .coverage
 .pytest_cache
+
+# Written by ads_mcp/scripts/deploy_runtime.py into a deployment checkout.
+# It records the exact commit that deployment was cut from, so it must never
+# be committed back into the repository.
+RUNTIME_REVISION
