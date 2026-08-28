@@ -18,6 +18,8 @@ import asyncio
 import sys
 
 from ads_mcp.coordinator import mcp_server
+from ads_mcp.governance import flags
+from ads_mcp.governance import provenance
 from ads_mcp.scripts.generate_views import update_views_yaml
 from ads_mcp.tools import loader
 from ads_mcp.tools._utils import get_ads_client
@@ -41,7 +43,17 @@ loaded_tiers = loader.load_tools()
 
 
 def main():
-  """Initializes and runs the MCP server."""
+  """Initializes and runs the MCP server.
+
+  The runtime check sits here, not at import time, because importing this
+  module to inspect the registry is legitimate; SERVING from a runtime
+  that cannot prove its revision is not. Nothing below this line runs
+  until the check passes.
+  """
+  runtime_provenance = provenance.verify_pinned_runtime(
+      require_pin=flags.mutations_enabled()
+  )
+  print(provenance.describe_provenance(runtime_provenance), file=sys.stderr)
   asyncio.run(update_views_yaml())  # Check and update docs resource
   get_ads_client()  # Check Google Ads credentials
   print("mcp server starting...", file=sys.stderr)

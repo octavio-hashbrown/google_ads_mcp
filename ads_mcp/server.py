@@ -16,8 +16,11 @@
 
 import asyncio
 import os
+import sys
 
 from ads_mcp.coordinator import mcp_server
+from ads_mcp.governance import flags
+from ads_mcp.governance import provenance
 from ads_mcp.scripts.generate_views import update_views_yaml
 from ads_mcp.tools import loader
 from ads_mcp.tools._utils import get_ads_client
@@ -56,7 +59,16 @@ if os.getenv("FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_ID") and os.getenv(
 
 
 def main():
-  """Initializes and runs the MCP server."""
+  """Initializes and runs the MCP server.
+
+  Same fail-closed runtime check as the stdio entrypoint, at the same
+  serve-time boundary. Both transports call the one implementation in
+  governance/provenance.py rather than duplicating the gating block.
+  """
+  runtime_provenance = provenance.verify_pinned_runtime(
+      require_pin=flags.mutations_enabled()
+  )
+  print(provenance.describe_provenance(runtime_provenance), file=sys.stderr)
   asyncio.run(update_views_yaml())  # Check and update docs resource
   get_ads_client()  # Check Google Ads credentials
   print("mcp server starting...")

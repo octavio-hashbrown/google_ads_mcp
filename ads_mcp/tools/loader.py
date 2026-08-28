@@ -39,14 +39,18 @@ def load_tools(*, log: bool = True) -> dict[str, object]:
   from ads_mcp.tools import docs  # pylint: disable=g-import-not-at-top
   from ads_mcp.tools import planning  # pylint: disable=g-import-not-at-top
   from ads_mcp.tools import reporting  # pylint: disable=g-import-not-at-top
+  from ads_mcp.tools import runtime  # pylint: disable=g-import-not-at-top
 
   loaded = {
-      "read": ["reporting", "accounts", "docs", "planning"],
+      "read": ["reporting", "accounts", "docs", "planning", "runtime"],
       "validate": [],
       "governed": [],
       "raw": [],
   }
-  del accounts, docs, planning, reporting  # imported for side effects only
+  # Imported for side effects only. `runtime` is READ tier on purpose: a
+  # session must be able to prove which revision it is talking to even
+  # when every mutation tier is switched off.
+  del accounts, docs, planning, reporting, runtime
 
   # ---- GOVERNED tier + validate-only probe. ----------------------------
   if flags.mutations_enabled():

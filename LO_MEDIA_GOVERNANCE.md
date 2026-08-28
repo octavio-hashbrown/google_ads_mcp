@@ -101,6 +101,9 @@ It proves a mutation *could* be submitted. It is never evidence that one
   (`propose_*` / `apply_*`) plus `validate_only_capability_check`.
 - `ADS_MCP_ENABLE_RAW_MUTATIONS=true` — additionally enables the **raw**
   immediate-execution tools. Requires the above. Defaults to false.
+- `ADS_MCP_PINNED_REVISION=<40-char commit>` — the exact revision this
+  deployment must be running. **Required whenever the governed tier is
+  enabled.** See *Pinned runtime* below.
 - `LO_AGENCY_CLIENT_ROOT=/path/to/client/folder` — default location for
   `pending_approvals/`, `applied_approvals/`, `rejected_approvals/`,
   and `client_audit_log.md`. Each `propose_*` / `apply_*` call may also
@@ -108,6 +111,70 @@ It proves a mutation *could* be submitted. It is never evidence that one
 
 The resolved posture is printed to stderr at startup, e.g.
 `[ads-mcp governance] GOVERNED ONLY -- propose/approve/apply; raw tools NOT exposed`.
+
+## Pinned runtime
+
+A proposal is only as trustworthy as the code that framed it, so the
+governed tier refuses to serve from a runtime that cannot prove which
+revision it is executing.
+
+**The defect this replaced.** The MCP was launched with
+`uv run --directory <developer working tree>`, so each instance imported
+whatever happened to be checked out when it spawned. On 2026-08-26 five
+concurrent sessions were found running four different revisions — one
+predating the governance work entirely — and nothing in a running process
+could report which revision it was. Answering "what is this session
+running?" required inspecting OS process tables against a git reflog.
+
+**How it works now.**
+
+- `ads_mcp/scripts/deploy_runtime.py` cuts a separate git worktree in
+  **detached HEAD** at one commit. Detached is the point: it follows no
+  branch, so ordinary development cannot move it.
+- The deployment writes a `RUNTIME_REVISION` stamp, so the process can
+  state its revision without shelling out to git.
+- `ADS_MCP_PINNED_REVISION` in the launch config states the revision the
+  operator intends.
+
+**Three identities, compared rather than trusted.** The pin, the stamp,
+and the actual `git rev-parse HEAD` are read independently and must all
+be valid 40-character commit shas and exactly equal. The stamp is never
+allowed to stand in for HEAD: a stamped deployment that someone has since
+checked out to a different clean commit would otherwise report one
+revision while executing another.
+
+At **serve time** the governed tier refuses when any of the following
+holds. Anything that cannot be determined is a refusal, never a pass:
+
+  1. no pin configured, or a pin that is not a full commit sha
+  2. no deployment stamp — a working tree is not a deployment, however
+     well its HEAD happens to line up
+  3. a stamp that is not a full commit sha
+  4. HEAD unreadable, or not a full commit sha
+  5. stamp ≠ HEAD (the deployment was moved after it was cut)
+  6. pin ≠ stamp
+  7. tracked files modified, or modification status unknown
+  8. untracked files other than the stamp — an untracked `.py` inside the
+     package can shadow or extend what is imported — or an enumeration
+     that failed
+  9. HEAD not detached, or detachment unknown
+
+  The check sits in `main()`, not at import: importing the module to
+  inspect the registry is legitimate; serving unverified is not.
+- `get_runtime_provenance` (READ tier) lets any session prove what it is
+  talking to. It is READ tier on purpose — provable revision must survive
+  every mutation tier being switched off.
+
+Read-only use may stay unpinned, so local development is unaffected. The
+governed tier may not.
+
+```bash
+uv run -m ads_mcp.scripts.deploy_runtime --revision origin/lo-media-mutations
+```
+
+The script prints the exact `~/.claude.json` block to use. Deployment
+takes effect on the next session spawn: a running MCP keeps the code it
+already imported.
 
 ## File layout
 
