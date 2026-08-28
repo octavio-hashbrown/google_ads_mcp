@@ -134,8 +134,31 @@ running?" required inspecting OS process tables against a git reflog.
 - The deployment writes a `RUNTIME_REVISION` stamp, so the process can
   state its revision without shelling out to git.
 - `ADS_MCP_PINNED_REVISION` in the launch config states the revision the
-  operator intends. At **serve time** the entrypoint refuses to start if
-  the runtime is unpinned, unprovable, mismatched, or edited in place.
+  operator intends.
+
+**Three identities, compared rather than trusted.** The pin, the stamp,
+and the actual `git rev-parse HEAD` are read independently and must all
+be valid 40-character commit shas and exactly equal. The stamp is never
+allowed to stand in for HEAD: a stamped deployment that someone has since
+checked out to a different clean commit would otherwise report one
+revision while executing another.
+
+At **serve time** the governed tier refuses when any of the following
+holds. Anything that cannot be determined is a refusal, never a pass:
+
+  1. no pin configured, or a pin that is not a full commit sha
+  2. no deployment stamp — a working tree is not a deployment, however
+     well its HEAD happens to line up
+  3. a stamp that is not a full commit sha
+  4. HEAD unreadable, or not a full commit sha
+  5. stamp ≠ HEAD (the deployment was moved after it was cut)
+  6. pin ≠ stamp
+  7. tracked files modified, or modification status unknown
+  8. untracked files other than the stamp — an untracked `.py` inside the
+     package can shadow or extend what is imported — or an enumeration
+     that failed
+  9. HEAD not detached, or detachment unknown
+
   The check sits in `main()`, not at import: importing the module to
   inspect the registry is legitimate; serving unverified is not.
 - `get_runtime_provenance` (READ tier) lets any session prove what it is

@@ -22,16 +22,27 @@ def get_runtime_provenance() -> dict:
   runtime genuinely cannot prove what it is running -- that is reported
   honestly rather than guessed.
 
-  Fields:
-      revision: The commit this process loaded, or None if unprovable.
-      revision_source: "deployment_stamp" (authoritative, written when
-          the deployment was cut), "git_working_tree" (a developer
-          checkout, mutable), or "unknown".
+  Three identities are reported independently and never inferred from
+  one another, because an earlier version trusting the stamp alone would
+  report one revision while executing a different one:
+
       pinned_revision: What ADS_MCP_PINNED_REVISION requires, if set.
-      matches_pin: Whether the running code matches that pin.
-      working_tree_dirty: True when tracked files differ from the
-          revision, meaning the imported code is not the reviewed code.
-      immutable: True only when cut by a deployment and unedited since.
+      stamp_revision: What the deployment was cut from.
+      git_head_revision: What is actually checked out right now.
+
+  Other fields:
+      revision: Best available identity, for display. Prefer comparing
+          the three above.
+      revision_source: "deployment_stamp", "git_working_tree" (a mutable
+          developer checkout), or "unknown".
+      matches_pin: True only when all three identities agree.
+      working_tree_dirty: True when tracked files differ from HEAD.
+          None means it could not be determined, which is not a pass.
+      unexpected_untracked: Untracked paths other than the deployment
+          stamp. These can shadow or extend what Python imports.
+      detached_head: True when the deployment follows no branch.
+      immutable: True only when stamped, still on that exact commit,
+          still detached, unedited and with nothing added.
       governed_tier_enabled: Whether propose/approve/apply is loaded.
   """
   state = provenance.runtime_provenance()
