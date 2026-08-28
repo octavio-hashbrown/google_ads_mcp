@@ -11,7 +11,12 @@ from unittest import mock
 from ads_mcp.tools import gated_assets
 from ads_mcp.tools import mutations_gated
 from fastmcp.exceptions import ToolError
+import importlib
+import inspect
+
 from google.ads.googleads.errors import GoogleAdsException
+from ads_mcp.tools._ads_api import google_ads as _ads_version
+from ads_mcp.tools._ads_api import service_types
 import pytest
 
 
@@ -161,15 +166,74 @@ def _link_row(
   return row
 
 
+# ---------------------------------------------------------------------------
+# Real generated Google Ads service classes, so mocks enforce real
+# signatures. The API version is taken from ads_mcp.tools._ads_api rather
+# than hardcoded here, so a version bump cannot leave these tests asserting
+# against a stale contract.
+# ---------------------------------------------------------------------------
+
+_SERVICE_CLASS_PATHS = {
+    "AssetService": ("asset_service", "AssetServiceClient"),
+    "AdGroupAssetService": (
+        "ad_group_asset_service",
+        "AdGroupAssetServiceClient",
+    ),
+    "CampaignAssetService": (
+        "campaign_asset_service",
+        "CampaignAssetServiceClient",
+    ),
+}
+
+ASSET_SERVICE_CONTRACTS = {
+    "mutate_assets": ("AssetService", "MutateAssetsRequest"),
+    "mutate_ad_group_assets": (
+        "AdGroupAssetService",
+        "MutateAdGroupAssetsRequest",
+    ),
+    "mutate_campaign_assets": (
+        "CampaignAssetService",
+        "MutateCampaignAssetsRequest",
+    ),
+}
+
+
+def _real_service_class(service_name):
+  module_name, class_name = _SERVICE_CLASS_PATHS[service_name]
+  module = importlib.import_module(
+      f"{_ads_version.__name__}.services.services.{module_name}"
+  )
+  return getattr(module, class_name)
+
+
+def _autospec_service(service_name):
+  """A service mock that rejects arguments the real client would reject."""
+  return mock.create_autospec(
+      _real_service_class(service_name), instance=True
+  )
+
+
+def _operation_for(method):
+  """A REAL operation proto, because request messages reject sentinels."""
+  if method == "mutate_assets":
+    return gated_assets.build_call_asset_operation("2017466577", "US")
+  if method == "mutate_ad_group_assets":
+    return gated_assets.build_ad_group_asset_operation(AD_GROUP, ASSET)
+  return gated_assets.build_campaign_asset_operation(CAMPAIGN, ASSET)
+
+
 def _client(search_side_effect):
   """Wires a client whose get_service dispatches by service name."""
   google_ads = mock.Mock()
   google_ads.search.side_effect = search_side_effect
+  # Autospec, NOT bare Mock. A bare Mock accepts any keyword argument,
+  # which is exactly how the validate_only defect reached production:
+  # the tests happily recorded a kwarg the real client never accepted.
   services = {
       "GoogleAdsService": google_ads,
-      "AssetService": mock.Mock(),
-      "AdGroupAssetService": mock.Mock(),
-      "CampaignAssetService": mock.Mock(),
+      "AssetService": _autospec_service("AssetService"),
+      "AdGroupAssetService": _autospec_service("AdGroupAssetService"),
+      "CampaignAssetService": _autospec_service("CampaignAssetService"),
   }
   client = mock.Mock()
   client.get_service.side_effect = lambda n: services[n]
@@ -1006,7 +1070,7 @@ def test_campaign_apply_links_and_verifies():
 
   operation = services[
       "CampaignAssetService"
-  ].mutate_campaign_assets.call_args.kwargs["operations"][0]
+  ].mutate_campaign_assets.call_args.kwargs["request"].operations[0]
   assert operation.create.campaign == CAMPAIGN
   assert operation.create.asset == ASSET
   assert operation.create.field_type.name == "CALL"
@@ -1265,26 +1329,60 @@ ASSET_METHODS = [
 ]
 
 
-@pytest.mark.parametrize("method", ASSET_METHODS)
-def test_preflight_validates_then_commits_the_same_operation(method):
-  service = mock.Mock()
-  operation = object()
+def _preflight_calls(method):
+  """Runs the preflight helper against an autospec'd service."""
+  service_name, request_name = ASSET_SERVICE_CONTRACTS[method]
+  service = _autospec_service(service_name)
+  operation = _operation_for(method)
   gated_assets._mutate_with_preflight(service, method, "123", operation)
+  return getattr(service, method).call_args_list, operation, request_name
 
-  calls = getattr(service, method).call_args_list
+
+@pytest.mark.parametrize("method", ASSET_METHODS)
+def test_preflight_and_commit_use_the_supported_request_contract(method):
+  """A, B, C, D, F, G, H, I -- the whole request contract in one pass."""
+  calls, operation, request_name = _preflight_calls(method)
+  request_type = getattr(service_types, request_name)
+
+  # F: exactly one preflight and exactly one commit.
   assert len(calls) == 2
-  assert calls[0].kwargs["validate_only"] is True
-  assert calls[1].kwargs["validate_only"] is False
-  # The dry run must exercise the identical operation, or it proves nothing.
-  assert calls[0].kwargs["operations"] == [operation]
-  assert calls[1].kwargs["operations"] == [operation]
-  assert calls[0].kwargs["customer_id"] == "123"
+
+  for call in calls:
+    # A: the request travels as a request MESSAGE...
+    assert "request" in call.kwargs
+    assert isinstance(call.kwargs["request"], request_type)
+    # I: ...and never as loose method keywords. This is the defect.
+    assert "validate_only" not in call.kwargs
+    assert "customer_id" not in call.kwargs
+    assert "operations" not in call.kwargs
+    assert call.args == ()
+
+  preflight, commit = calls[0].kwargs["request"], calls[1].kwargs["request"]
+
+  # B / G: dry run first, then the real thing.
+  assert preflight.validate_only is True
+  assert commit.validate_only is False
+
+  # C: correct account on both passes.
+  assert preflight.customer_id == "123"
+  assert commit.customer_id == "123"
+
+  # D / H: the committed operation is byte-identical to the validated one,
+  # compared on the serialized payload rather than object identity.
+  expected = type(operation).serialize(operation)
+  assert type(preflight.operations[0]).serialize(preflight.operations[0]) == expected
+  assert type(commit.operations[0]).serialize(commit.operations[0]) == expected
+
+  # All-or-nothing on both passes.
+  assert preflight.partial_failure is False
+  assert commit.partial_failure is False
 
 
 @pytest.mark.parametrize("method", ASSET_METHODS)
 def test_failed_validation_never_commits_zero_live_delta(method):
-  """Invalid resource/link must fail validation and write nothing."""
-  service = mock.Mock()
+  """E: an invalid operation must fail validation and write nothing."""
+  service_name, _ = ASSET_SERVICE_CONTRACTS[method]
+  service = _autospec_service(service_name)
   getattr(service, method).side_effect = GoogleAdsException(
       None, None, None, None
   )
@@ -1292,20 +1390,93 @@ def test_failed_validation_never_commits_zero_live_delta(method):
       gated_assets, "_handle_google_ads_error", side_effect=ToolError("invalid")
   ):
     with pytest.raises(ToolError):
-      gated_assets._mutate_with_preflight(service, method, "123", object())
+      gated_assets._mutate_with_preflight(
+          service, method, "123", _operation_for(method)
+      )
 
   calls = getattr(service, method).call_args_list
   assert len(calls) == 1, "the real mutate must never run after a failed dry run"
-  assert calls[0].kwargs["validate_only"] is True
+  assert calls[0].kwargs["request"].validate_only is True
+
+
+@pytest.mark.parametrize("method", ASSET_METHODS)
+def test_unexpected_preflight_exception_fails_closed(method):
+  """J: a non-GoogleAds error in the dry run must not reach a commit.
+
+  This is the exact shape of the 2026-08-27 incident: the preflight raised
+  TypeError before touching Google, and nothing was committed.
+  """
+  service_name, _ = ASSET_SERVICE_CONTRACTS[method]
+  service = _autospec_service(service_name)
+  getattr(service, method).side_effect = TypeError(
+      "got an unexpected keyword argument 'validate_only'"
+  )
+  with pytest.raises(TypeError):
+    gated_assets._mutate_with_preflight(
+        service, method, "123", _operation_for(method)
+    )
+
+  assert len(getattr(service, method).call_args_list) == 1, (
+      "a broken preflight is a stop condition, never a reason to commit"
+  )
+
+
+def test_preflight_refuses_a_method_with_no_registered_request_type():
+  """Fail closed rather than commit without a dry run."""
+  service = mock.Mock()
+  with pytest.raises(ToolError) as excinfo:
+    gated_assets._mutate_with_preflight(
+        service, "mutate_something_unmapped", "123", object()
+    )
+  assert "no registered validate_only request type" in str(excinfo.value)
+  service.mutate_something_unmapped.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# SDK CONTRACT REGRESSION
+#
+# The defect survived review because a bare Mock will happily record any
+# keyword the caller invents. These tests pin the real external contract so
+# a future local mock cannot re-invent a parameter Google does not accept.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", ASSET_METHODS)
+def test_sdk_does_not_accept_validate_only_as_a_method_kwarg(method):
+  service_name, request_name = ASSET_SERVICE_CONTRACTS[method]
+  params = inspect.signature(
+      getattr(_real_service_class(service_name), method)
+  ).parameters
+
+  assert "request" in params
+  assert "validate_only" not in params, (
+      f"{method} does not take validate_only as a method argument; it "
+      "belongs on the request message"
+  )
+  # And the request message is where the flag actually lives.
+  assert "validate_only" in getattr(service_types, request_name).meta.fields
+
+
+@pytest.mark.parametrize("method", ASSET_METHODS)
+def test_autospec_service_rejects_the_old_invalid_call_shape(method):
+  """The precise call the shipped code made must now fail in tests."""
+  service_name, _ = ASSET_SERVICE_CONTRACTS[method]
+  service = _autospec_service(service_name)
+  with pytest.raises(TypeError):
+    getattr(service, method)(
+        customer_id="123",
+        operations=[_operation_for(method)],
+        validate_only=True,
+    )
 
 
 def test_create_call_asset_uses_preflight():
-  service = mock.Mock()
-  service.mutate_assets.return_value = _mutate_result(ASSET)
-  client, _ = _client([])
-  client.get_service.side_effect = lambda n: service
+  client, services = _client([])
+  services["AssetService"].mutate_assets.return_value = _mutate_result(ASSET)
   assert gated_assets._create_call_asset(client, "123", "2017466577", "US") == ASSET
-  assert service.mutate_assets.call_args_list[0].kwargs["validate_only"] is True
+  calls = services["AssetService"].mutate_assets.call_args_list
+  assert calls[0].kwargs["request"].validate_only is True
+  assert calls[1].kwargs["request"].validate_only is False
 
 
 # ---------------------------------------------------------------------------
@@ -1322,16 +1493,16 @@ def test_campaign_asset_remove_operation_targets_the_link_only():
 
 
 def test_campaign_asset_remove_runs_through_preflight():
-  service = mock.Mock()
+  service = _autospec_service("CampaignAssetService")
   operation = gated_assets.build_campaign_asset_remove_operation(LINK)
   gated_assets._mutate_with_preflight(
       service, "mutate_campaign_assets", "123", operation
   )
   calls = service.mutate_campaign_assets.call_args_list
   assert len(calls) == 2
-  assert calls[0].kwargs["validate_only"] is True
-  assert calls[1].kwargs["validate_only"] is False
-  assert calls[0].kwargs["operations"][0].remove == LINK
+  assert calls[0].kwargs["request"].validate_only is True
+  assert calls[1].kwargs["request"].validate_only is False
+  assert calls[0].kwargs["request"].operations[0].remove == LINK
 
 
 OTHER_LINK = "customers/123/campaignAssets/789~999~CALL"
@@ -1425,9 +1596,9 @@ def test_detach_executor_removes_verifies_and_keeps_the_asset():
       "CampaignAssetService"
   ].mutate_campaign_assets.call_args_list
   assert len(calls) == 2
-  assert calls[0].kwargs["validate_only"] is True
-  assert calls[1].kwargs["validate_only"] is False
-  assert calls[0].kwargs["operations"][0].remove == LINK
+  assert calls[0].kwargs["request"].validate_only is True
+  assert calls[1].kwargs["request"].validate_only is False
+  assert calls[0].kwargs["request"].operations[0].remove == LINK
 
 
 def test_detach_executor_fails_when_link_still_reads_back():

@@ -743,6 +743,21 @@ def list_call_assets(
 # -----------------------------------------------------------------------------
 
 
+# validate_only is a field on the REQUEST MESSAGE, not a parameter of the
+# generated service method. The generated signature is
+# mutate_x(request=None, *, customer_id=None, operations=None, retry=...,
+# timeout=..., metadata=...) -- passing validate_only alongside
+# customer_id/operations raises TypeError before anything reaches Google.
+# This mapping keeps each method bound to the request message that carries
+# the flag, matching the request= idiom already used by the ad-copy and
+# conversion paths.
+_PREFLIGHT_REQUEST_TYPES = {
+    "mutate_assets": service_types.MutateAssetsRequest,
+    "mutate_ad_group_assets": service_types.MutateAdGroupAssetsRequest,
+    "mutate_campaign_assets": service_types.MutateCampaignAssetsRequest,
+}
+
+
 def _mutate_with_preflight(
     service, method_name: str, customer_id: str, operation
 ):
@@ -756,22 +771,40 @@ def _mutate_with_preflight(
   Only if it is accepted does the identical operation run for real. The
   asset paths previously committed with no dry run at all, unlike the ad
   copy and migration paths.
+
+  Both passes are built from the same `operation` object and differ only
+  in `validate_only`, so what Google validated is what Google commits.
+
+  FAIL-CLOSED by design. If the preflight cannot be executed at all --
+  unknown method, wrong request shape, TypeError from the client library
+  -- the exception propagates and NO commit is attempted. A broken
+  preflight is a stop condition, never permission to skip the preflight.
   """
+  request_type = _PREFLIGHT_REQUEST_TYPES.get(method_name)
+  if request_type is None:
+    raise ToolError(
+        f"Refusing to mutate: {method_name} has no registered validate_only "
+        "request type, so the operation cannot be pre-validated. A mutation "
+        "is never committed without a successful preflight."
+    )
+
   mutate = getattr(service, method_name)
-  try:
-    mutate(
+
+  def _build(validate_only: bool):
+    return request_type(
         customer_id=customer_id,
         operations=[operation],
-        validate_only=True,
+        # All-or-nothing: the approved operation must not land partially.
+        partial_failure=False,
+        validate_only=validate_only,
     )
+
+  try:
+    mutate(request=_build(True))
   except GoogleAdsException as e:
     _handle_google_ads_error(e)
   try:
-    return mutate(
-        customer_id=customer_id,
-        operations=[operation],
-        validate_only=False,
-    )
+    return mutate(request=_build(False))
   except GoogleAdsException as e:
     _handle_google_ads_error(e)
 
