@@ -68,6 +68,10 @@ def main():
   runtime_provenance = provenance.verify_pinned_runtime(
       require_pin=flags.mutations_enabled()
   )
+  # Freeze it here, while stdin is still ours. Once the transport owns
+  # stdin, spawning git blocks -- measured 2026-08-31 -- so nothing on the
+  # request path may shell out. get_runtime_provenance serves this.
+  provenance.record_startup_snapshot(runtime_provenance)
   print(provenance.describe_provenance(runtime_provenance), file=sys.stderr)
   asyncio.run(update_views_yaml())  # Check and update docs resource
   get_ads_client()  # Check Google Ads credentials

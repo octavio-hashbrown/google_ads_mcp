@@ -36,6 +36,7 @@ import os
 import pathlib
 import re
 import subprocess
+import time
 
 PINNED_REVISION_VAR = "ADS_MCP_PINNED_REVISION"
 STAMP_FILENAME = "RUNTIME_REVISION"
@@ -88,6 +89,11 @@ def _git(root: pathlib.Path, *args: str) -> str | None:
         ("git", *args),
         cwd=str(root),
         capture_output=True,
+        # NEVER inherit stdin. Under the stdio transport the server's stdin
+        # is the JSON-RPC pipe; a child that inherits it blocks. Measured
+        # 2026-08-31: without this, each call sat until the 10s timeout
+        # (~30s per request, git HEAD unresolved); with it, 0.58s.
+        stdin=subprocess.DEVNULL,
         text=True,
         timeout=10,
         check=False,
@@ -194,6 +200,22 @@ def runtime_provenance() -> dict[str, object]:
       ),
       "immutable": immutable,
   }
+
+
+# The verified state this PROCESS started with. Populated once, by the
+# entrypoint, at the same moment the gate runs -- before the stdio
+# transport owns stdin.
+#
+# Why a snapshot rather than re-reading on demand: the running process
+# imported its code at startup and cannot un-import it. What a session
+# needs to know is what THIS process loaded, which a later re-read cannot
+# tell it any better and can only report less reliably. Re-reading also
+# put a subprocess on the request path, which is what broke.
+_STARTUP_SNAPSHOT: dict[str, object] | None = None
+
+
+class NoStartupSnapshotError(RuntimeError):
+  """Raised when provenance is requested before startup recorded it."""
 
 
 class UnpinnedRuntimeError(RuntimeError):
@@ -327,6 +349,46 @@ def verify_pinned_runtime(*, require_pin: bool) -> dict[str, object]:
     )
 
   return state
+
+
+def record_startup_snapshot(state: dict[str, object]) -> dict[str, object]:
+  """Freezes the verified startup state, tagged to this process.
+
+  Called by the entrypoint immediately after the gate passes. The pid and
+  the module load time make it obvious if a snapshot were ever somehow
+  read from a different process than the one answering.
+  """
+  global _STARTUP_SNAPSHOT
+  snapshot = dict(state)
+  snapshot["process_id"] = os.getpid()
+  snapshot["verified_at_startup"] = True
+  snapshot["snapshot_monotonic"] = time.monotonic()
+  _STARTUP_SNAPSHOT = snapshot
+  return snapshot
+
+
+def startup_snapshot() -> dict[str, object]:
+  """The verified state recorded at startup.
+
+  Raises:
+      NoStartupSnapshotError: when startup never recorded one. That means
+          the process did not come up through a verified entrypoint, so
+          there is nothing trustworthy to report -- and inventing an
+          answer by re-reading now would be exactly the wrong move.
+  """
+  if _STARTUP_SNAPSHOT is None:
+    raise NoStartupSnapshotError(
+        "No startup-verified provenance is available in this process. The "
+        "server did not record one at launch, so what it is executing "
+        "cannot be attested. Restart through ads_mcp.stdio or "
+        "ads_mcp.server."
+    )
+  snapshot = dict(_STARTUP_SNAPSHOT)
+  snapshot["reported_by_process_id"] = os.getpid()
+  snapshot["process_identity_matches"] = (
+      snapshot["process_id"] == os.getpid()
+  )
+  return snapshot
 
 
 def describe_provenance(state: dict[str, object]) -> str:

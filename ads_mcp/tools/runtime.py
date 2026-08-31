@@ -1,10 +1,20 @@
 """Read-only tool that lets a session prove what code it is talking to.
 
+Serves the snapshot the entrypoint verified and froze at startup. It does
+NOT shell out to git on the request path: under the stdio transport a
+child process inherits the JSON-RPC stdin pipe and blocks, which made
+this tool take ~30s and return an unresolved HEAD (measured 2026-08-31,
+live incident on the Cop Call deployment). The snapshot is also the more
+honest answer -- the process imported its code at startup and cannot
+un-import it, so what it loaded then is what it is running now.
+
 Without this, answering "which revision is this MCP running?" meant
 inspecting operating-system process tables and correlating spawn times
 against a git reflog. That is forensics, not governance, and it is not
 available to the session that actually needs the answer.
 """
+
+from fastmcp.exceptions import ToolError
 
 from ads_mcp.coordinator import mcp_server as mcp
 from ads_mcp.governance import flags
@@ -45,7 +55,10 @@ def get_runtime_provenance() -> dict:
           still detached, unedited and with nothing added.
       governed_tier_enabled: Whether propose/approve/apply is loaded.
   """
-  state = provenance.runtime_provenance()
+  try:
+    state = provenance.startup_snapshot()
+  except provenance.NoStartupSnapshotError as e:
+    raise ToolError(str(e)) from e
   state["governed_tier_enabled"] = flags.mutations_enabled()
   state["raw_tier_enabled"] = flags.raw_mutations_enabled()
   return state
