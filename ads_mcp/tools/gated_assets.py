@@ -1165,6 +1165,8 @@ def propose_attach_call_asset_to_campaign(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes linking an EXISTING call asset to a CAMPAIGN.
 
@@ -1192,6 +1194,14 @@ def propose_attach_call_asset_to_campaign(
           re-checked at apply.
       reuse_incompatible_asset: Required to be True before an existing
           asset with a blocking configuration difference will be reused.
+      supersedes: Code of a retired proposal this one re-issues. Required
+          when an identical operation was already proposed and retired --
+          without it the deterministic code would collide with the retired
+          one and this call refuses. The replacement must be the same
+          operation and receives its own code.
+      supersedes_evidence: Mandatory when the superseded proposal was
+          APPLIED: how the live account was checked, and why the
+          operation is not already in effect.
 %s
       login_customer_id: MCC account ID if customer is managed.
   """
@@ -1232,6 +1242,8 @@ def propose_attach_call_asset_to_campaign(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
 
 
