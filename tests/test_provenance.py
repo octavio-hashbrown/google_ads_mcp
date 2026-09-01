@@ -369,11 +369,20 @@ def test_runtime_tool_is_read_tier(monkeypatch):
 
 
 def test_provenance_tool_reports_all_three_identities(monkeypatch):
+  """The tool serves the startup snapshot, never a fresh git read.
+
+  Re-reading on the request path is what hung the live MCP on
+  2026-08-31; see tests/test_provenance_runtime_boundary.py.
+  """
   from ads_mcp.tools import runtime as runtime_tool
 
   monkeypatch.setenv("ADS_MCP_ENABLE_MUTATIONS", "true")
   monkeypatch.setenv("ADS_MCP_ENABLE_RAW_MUTATIONS", "false")
   _deployed(monkeypatch)
+  monkeypatch.setattr(provenance, "_STARTUP_SNAPSHOT", None)
+  provenance.record_startup_snapshot(
+      provenance.verify_pinned_runtime(require_pin=True)
+  )
 
   state = runtime_tool.get_runtime_provenance()
   assert state["pinned_revision"] == A
