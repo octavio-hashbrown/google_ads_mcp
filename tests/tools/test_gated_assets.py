@@ -2188,3 +2188,94 @@ def test_post_apply_succeeds_when_target_absent_and_replacement_intact():
   )
   assert out["outcome"] == "applied"
   assert out["remaining_serving_links"][0]["status"] == "ENABLED"
+
+
+# ---------------------------------------------------------------------------
+# Approval-code lifecycle, end to end through the tool surface
+# ---------------------------------------------------------------------------
+
+
+def _attach_rows():
+  """One propose call's worth of GAQL responses."""
+  return [
+      [],
+      [_asset_row(conversion_action=ASSET_ACTION)],
+      [_settings_row()],
+      [_action_row()],
+  ]
+
+
+@mock.patch("ads_mcp.tools.gated_assets._get_client")
+@mock.patch("ads_mcp.tools.gated_assets.audit.resolve_client_root")
+@mock.patch("ads_mcp.tools.gated_assets.mutations_gated._gaql_lookup_campaign")
+def test_campaign_propose_refuses_to_reissue_a_retired_code(
+    mock_lookup, mock_root, mock_get_client, tmp_path
+):
+  """The Cop Call 2026-09-01 incident, through the real tool."""
+  from ads_mcp.governance import approval
+
+  mock_root.return_value = tmp_path
+  mock_lookup.return_value = "Growth-Specialty"
+  client, _ = _client(_attach_rows() + _attach_rows())
+  mock_get_client.return_value = client
+
+  def _propose(**kw):
+    return gated_assets.propose_attach_call_asset_to_campaign(
+        customer_id="123",
+        campaign_resource_name=CAMPAIGN,
+        phone_number="(201) 746-6577",
+        country_code="US",
+        reason_code="client_request",
+        expected_account_call_conversion_action=ACCOUNT_ACTION,
+        **kw,
+    )
+
+  first = _propose()
+  retired = approval.archive_proposal(
+      tmp_path, first["code"], outcome="rejected", note="must NOT be retried"
+  )
+
+  with pytest.raises(ToolError) as exc:
+    _propose()
+
+  assert "already used by a rejected" in str(exc.value)
+  assert retired.is_file(), "the retired artifact must survive"
+  assert not (
+      tmp_path / approval.PENDING_DIRNAME / f"{first['code']}.md"
+  ).exists()
+
+
+@mock.patch("ads_mcp.tools.gated_assets._get_client")
+@mock.patch("ads_mcp.tools.gated_assets.audit.resolve_client_root")
+@mock.patch("ads_mcp.tools.gated_assets.mutations_gated._gaql_lookup_campaign")
+def test_campaign_propose_supersedes_gives_a_new_code(
+    mock_lookup, mock_root, mock_get_client, tmp_path
+):
+  from ads_mcp.governance import approval
+
+  mock_root.return_value = tmp_path
+  mock_lookup.return_value = "Growth-Specialty"
+  client, _ = _client(_attach_rows() + _attach_rows())
+  mock_get_client.return_value = client
+
+  def _propose(**kw):
+    return gated_assets.propose_attach_call_asset_to_campaign(
+        customer_id="123",
+        campaign_resource_name=CAMPAIGN,
+        phone_number="(201) 746-6577",
+        country_code="US",
+        reason_code="client_request",
+        expected_account_call_conversion_action=ACCOUNT_ACTION,
+        **kw,
+    )
+
+  first = _propose()
+  approval.archive_proposal(
+      tmp_path, first["code"], outcome="rejected", note="retired"
+  )
+
+  replacement = _propose(supersedes=first["code"])
+
+  assert replacement["code"] != first["code"]
+  assert f"Supersedes:** `{first['code']}`" in replacement["block"]
+  assert "(revision 1)" in replacement["block"]
