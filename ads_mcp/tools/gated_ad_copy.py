@@ -458,6 +458,7 @@ def _execute_update_responsive_search_ads(
 
 
 @mcp.tool()
+@mutations_gated.with_common_args_doc
 def propose_update_responsive_search_ads(
     customer_id: str,
     update_label: str,
@@ -467,6 +468,8 @@ def propose_update_responsive_search_ads(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes text-only edits to EXISTING Responsive Search Ads.
 
@@ -482,6 +485,7 @@ def propose_update_responsive_search_ads(
   Applies as one AdService.MutateAds batch with partial_failure=False.
 
   Args:
+      customer_id: Google Ads customer ID (digits only).
       update_label: Short human name for this copy change.
       ads: One entry per ad:
           {"ad_id": "820665316770",
@@ -614,13 +618,9 @@ def propose_update_responsive_search_ads(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
-
-
-propose_update_responsive_search_ads.__doc__ = (
-    propose_update_responsive_search_ads.__doc__
-    % mutations_gated._common_propose_args_doc()  # pylint: disable=protected-access
-)
 
 
 mutations_gated.register_executor(OP, _execute_update_responsive_search_ads)
