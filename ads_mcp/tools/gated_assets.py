@@ -1051,6 +1051,7 @@ def _prepare_attachment(
 
 
 @mcp.tool()
+@mutations_gated.with_common_args_doc
 def propose_attach_call_asset_to_ad_group(
     customer_id: str,
     ad_group_resource_name: str,
@@ -1065,6 +1066,8 @@ def propose_attach_call_asset_to_ad_group(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes attaching a call asset to an AD GROUP, reusing where safe.
 
@@ -1137,13 +1140,9 @@ def propose_attach_call_asset_to_ad_group(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
-
-
-propose_attach_call_asset_to_ad_group.__doc__ = (
-    propose_attach_call_asset_to_ad_group.__doc__
-    % mutations_gated._common_propose_args_doc()  # pylint: disable=protected-access
-)
 
 
 # -----------------------------------------------------------------------------
@@ -1152,6 +1151,7 @@ propose_attach_call_asset_to_ad_group.__doc__ = (
 
 
 @mcp.tool()
+@mutations_gated.with_common_args_doc
 def propose_attach_call_asset_to_campaign(
     customer_id: str,
     campaign_resource_name: str,
@@ -1194,14 +1194,6 @@ def propose_attach_call_asset_to_campaign(
           re-checked at apply.
       reuse_incompatible_asset: Required to be True before an existing
           asset with a blocking configuration difference will be reused.
-      supersedes: Code of a retired proposal this one re-issues. Required
-          when an identical operation was already proposed and retired --
-          without it the deterministic code would collide with the retired
-          one and this call refuses. The replacement must be the same
-          operation and receives its own code.
-      supersedes_evidence: Mandatory when the superseded proposal was
-          APPLIED: how the live account was checked, and why the
-          operation is not already in effect.
 %s
       login_customer_id: MCC account ID if customer is managed.
   """
@@ -1245,12 +1237,6 @@ def propose_attach_call_asset_to_campaign(
       supersedes=supersedes,
       supersedes_evidence=supersedes_evidence,
   )
-
-
-propose_attach_call_asset_to_campaign.__doc__ = (
-    propose_attach_call_asset_to_campaign.__doc__
-    % mutations_gated._common_propose_args_doc()  # pylint: disable=protected-access
-)
 
 
 # -----------------------------------------------------------------------------
@@ -1467,6 +1453,7 @@ mutations_gated.register_executor(
 
 
 @mcp.tool()
+@mutations_gated.with_common_args_doc
 def propose_detach_call_asset_from_campaign(
     customer_id: str,
     campaign_resource_name: str,
@@ -1477,6 +1464,8 @@ def propose_detach_call_asset_from_campaign(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes DETACHING a CALL asset link from a CAMPAIGN.
 
@@ -1654,13 +1643,9 @@ def propose_detach_call_asset_from_campaign(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
-
-
-propose_detach_call_asset_from_campaign.__doc__ = (
-    propose_detach_call_asset_from_campaign.__doc__
-    % mutations_gated._common_propose_args_doc()  # pylint: disable=protected-access
-)
 
 
 def _execute_detach_call_asset_from_campaign(

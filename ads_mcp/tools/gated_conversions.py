@@ -264,6 +264,7 @@ def build_primary_for_goal_operations(
 
 
 @mcp.tool()
+@mutations_gated.with_common_args_doc
 def propose_set_conversion_actions_primary_for_goal(
     customer_id: str,
     conversion_action_ids: list[str],
@@ -279,6 +280,8 @@ def propose_set_conversion_actions_primary_for_goal(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes flipping primary_for_goal on a batch of conversion actions.
 
@@ -467,13 +470,9 @@ def propose_set_conversion_actions_primary_for_goal(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
-
-
-propose_set_conversion_actions_primary_for_goal.__doc__ = (
-    propose_set_conversion_actions_primary_for_goal.__doc__
-    % mutations_gated._common_propose_args_doc()  # pylint: disable=protected-access
-)
 
 
 # -----------------------------------------------------------------------------

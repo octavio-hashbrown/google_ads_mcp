@@ -103,6 +103,7 @@ def _read_ad_group_bids(
 
 
 @mcp.tool()
+@mutations_gated.with_common_args_doc
 def propose_set_manual_cpc(
     customer_id: str,
     campaign_resource_name: str,
@@ -113,6 +114,8 @@ def propose_set_manual_cpc(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes switching a Search campaign's bidding to Manual CPC.
 
@@ -231,13 +234,9 @@ def propose_set_manual_cpc(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
-
-
-propose_set_manual_cpc.__doc__ = (
-    propose_set_manual_cpc.__doc__
-    % mutations_gated._common_propose_args_doc()  # pylint: disable=protected-access
-)
 
 
 def build_manual_cpc_operation(

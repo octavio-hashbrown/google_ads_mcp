@@ -163,11 +163,36 @@ def _common_propose_args_doc() -> str:
       "          client_audit_log.md live. Falls back to env\n"
       "          LO_AGENCY_CLIENT_ROOT.\n"
       "      client_label: Human label shown in the proposal header\n"
-      "          (e.g., 'Spine & Health')."
+      "          (e.g., 'Spine & Health').\n"
+      "      supersedes: Code of a retired proposal this one re-issues.\n"
+      "          Required when an identical operation was already\n"
+      "          proposed and retired -- without it the deterministic\n"
+      "          code would collide with the retired one and this call\n"
+      "          refuses. The replacement must be the same operation\n"
+      "          and receives its own code.\n"
+      "      supersedes_evidence: Mandatory when the superseded\n"
+      "          proposal was APPLIED: how the live account was\n"
+      "          checked, and why the operation is not already in\n"
+      "          effect."
   )
 
 
+def with_common_args_doc(fn):
+  """Interpolates the shared Args block into a propose tool's docstring.
+
+  Applied BELOW @mcp.tool() so it runs first. The previous approach
+  assigned `fn.__doc__` at module level, which executed after the tool
+  had already been registered, so the description callers actually
+  received still contained a literal "%s" and none of the shared
+  argument documentation reached them.
+  """
+  if fn.__doc__ and "%s" in fn.__doc__:
+    fn.__doc__ = fn.__doc__ % _common_propose_args_doc()
+  return fn
+
+
 @mcp.tool()
+@with_common_args_doc
 def propose_pause_keyword(
     customer_id: str,
     criterion_resource_name: str,
@@ -176,6 +201,8 @@ def propose_pause_keyword(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes pausing an existing ad-group keyword.
 
@@ -220,15 +247,13 @@ def propose_pause_keyword(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
 
 
-propose_pause_keyword.__doc__ = propose_pause_keyword.__doc__ % (
-    _common_propose_args_doc()
-)
-
-
 @mcp.tool()
+@with_common_args_doc
 def propose_enable_keyword(
     customer_id: str,
     criterion_resource_name: str,
@@ -237,6 +262,8 @@ def propose_enable_keyword(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes re-enabling a paused ad-group keyword.
 
@@ -276,15 +303,13 @@ def propose_enable_keyword(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
 
 
-propose_enable_keyword.__doc__ = propose_enable_keyword.__doc__ % (
-    _common_propose_args_doc()
-)
-
-
 @mcp.tool()
+@with_common_args_doc
 def propose_remove_keyword(
     customer_id: str,
     criterion_resource_name: str,
@@ -293,6 +318,8 @@ def propose_remove_keyword(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes removing (hard-deleting) an ad-group keyword.
 
@@ -331,15 +358,13 @@ def propose_remove_keyword(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
 
 
-propose_remove_keyword.__doc__ = propose_remove_keyword.__doc__ % (
-    _common_propose_args_doc()
-)
-
-
 @mcp.tool()
+@with_common_args_doc
 def propose_add_ad_group_negative(
     customer_id: str,
     ad_group_resource_name: str,
@@ -349,6 +374,8 @@ def propose_add_ad_group_negative(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes adding one or more negative keywords at the ad-group level.
 
@@ -404,15 +431,13 @@ def propose_add_ad_group_negative(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
 
 
-propose_add_ad_group_negative.__doc__ = (
-    propose_add_ad_group_negative.__doc__ % _common_propose_args_doc()
-)
-
-
 @mcp.tool()
+@with_common_args_doc
 def propose_add_campaign_negative(
     customer_id: str,
     campaign_resource_name: str,
@@ -422,6 +447,8 @@ def propose_add_campaign_negative(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes adding negative keywords at the campaign level.
 
@@ -474,15 +501,13 @@ def propose_add_campaign_negative(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
 
 
-propose_add_campaign_negative.__doc__ = (
-    propose_add_campaign_negative.__doc__ % _common_propose_args_doc()
-)
-
-
 @mcp.tool()
+@with_common_args_doc
 def propose_add_to_shared_negative_list(
     customer_id: str,
     shared_set_resource_name: str,
@@ -492,6 +517,8 @@ def propose_add_to_shared_negative_list(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes adding negatives to a shared set (Master Negative List).
 
@@ -545,12 +572,9 @@ def propose_add_to_shared_negative_list(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
-
-
-propose_add_to_shared_negative_list.__doc__ = (
-    propose_add_to_shared_negative_list.__doc__ % _common_propose_args_doc()
-)
 
 
 # -----------------------------------------------------------------------------

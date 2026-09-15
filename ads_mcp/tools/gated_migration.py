@@ -1132,6 +1132,7 @@ def _resolve_criterion(
 
 
 @mcp.tool()
+@mutations_gated.with_common_args_doc
 def propose_campaign_migration(
     customer_id: str,
     migration_label: str,
@@ -1154,6 +1155,8 @@ def propose_campaign_migration(
     client_root: str | None = None,
     client_label: str | None = None,
     login_customer_id: str | None = None,
+    supersedes: str | None = None,
+    supersedes_evidence: str | None = None,
 ) -> dict[str, str]:
   """Proposes a coordinated campaign migration as ONE immutable package.
 
@@ -1166,6 +1169,7 @@ def propose_campaign_migration(
   no supported way to apply half of it.
 
   Args:
+      customer_id: Google Ads customer ID (digits only).
       migration_label: Short human name for this migration, shown in the
           approval block.
       guard_master_campaign_id: Campaign whose ENABLED status, bidding
@@ -1437,13 +1441,9 @@ def propose_campaign_migration(
       reason_detail=reason_detail,
       spec=spec,
       client_label=client_label,
+      supersedes=supersedes,
+      supersedes_evidence=supersedes_evidence,
   )
-
-
-propose_campaign_migration.__doc__ = (
-    propose_campaign_migration.__doc__
-    % mutations_gated._common_propose_args_doc()  # pylint: disable=protected-access
-)
 
 
 mutations_gated.register_executor(OP, _execute_campaign_migration)
