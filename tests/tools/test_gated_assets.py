@@ -765,7 +765,7 @@ def test_campaign_propose_reuses_and_reports_account_state(
       expected_account_call_conversion_action=ACCOUNT_ACTION,
   )
   block = result["block"]
-  assert "Reuse existing call asset" in block
+  assert "APPROVED TARGET ASSET" in block
   assert "NOT modified" in block
   assert "NOTE:" in block and "NOT operative" in block
   assert "Calls from ads" in block and "30s threshold" in block
@@ -909,7 +909,7 @@ def test_ad_group_propose_reuses_existing_asset(
       reuse_existing_asset_only=True,
       expected_account_call_conversion_action=ACCOUNT_ACTION,
   )
-  assert "Reuse existing call asset" in result["block"]
+  assert "APPROVED TARGET ASSET" in result["block"]
   assert 'Ad group "Brand - Montvale"' in result["block"]
   services["AssetService"].mutate_assets.assert_not_called()
 
@@ -1023,6 +1023,7 @@ def _campaign_spec(**overrides):
       "country_code": "US",
       "reuse_asset_resource_name": ASSET,
       "reuse_existing_asset_only": True,
+      "target_asset_resource_name": ASSET,
       "reuse_incompatible_asset": False,
       "accepted_incompatibilities": [],
       "expected_account_call_conversion_action": ACCOUNT_ACTION,
@@ -1082,7 +1083,8 @@ def test_campaign_apply_refuses_when_asset_gone():
     gated_assets._execute_attach_call_asset_to_campaign(
         client, "123", _campaign_spec()
     )
-  assert "reuse-only" in str(exc.value)
+  assert "approved target CALL asset" in str(exc.value)
+  assert "NOT substitute another asset" in str(exc.value)
   services["AssetService"].mutate_assets.assert_not_called()
 
 
@@ -1141,6 +1143,7 @@ def _ad_group_spec(**overrides):
       "country_code": "US",
       "reuse_asset_resource_name": ASSET,
       "reuse_existing_asset_only": True,
+      "target_asset_resource_name": ASSET,
       "reuse_incompatible_asset": False,
       "accepted_incompatibilities": [],
       "expected_account_call_conversion_action": ACCOUNT_ACTION,
@@ -1304,6 +1307,7 @@ def test_apply_path_revalidates_live_and_demands_the_recorded_exception():
       "expected_account_call_conversion_action": ACCOUNT_ACTION,
       "accepted_unenumerable_account_reference": ACCOUNT_ACTION,
       "accepted_incompatibilities": [],
+      "target_asset_resource_name": ASSET,
   }
   client, _ = _client([[_asset_row()]])
   with mock.patch.object(

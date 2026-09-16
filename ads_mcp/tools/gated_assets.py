@@ -597,20 +597,156 @@ def _assess_asset_for_reuse(
   return assess_reuse_compatibility(asset, intended_state, asset_action)
 
 
-def _find_call_asset(
+def _find_call_assets(
     ads_client, customer_id: str, phone_number: str, country_code: str
-) -> dict[str, Any] | None:
-  """Returns an existing CALL asset matching phone + country, or None.
+) -> list[dict[str, Any]]:
+  """EVERY existing CALL asset matching phone + country.
 
-  Matching on number alone is NOT sufficient to justify reuse — callers
-  must assess the result before using it.
+  Returns a list, not a single asset, because a number is not an
+  identity: an account can legitimately hold several CALL assets
+  carrying the same digits. Callers must decide what to do about that
+  rather than being handed an arbitrary one.
+  """
+  return [
+      asset
+      for asset in _read_call_assets(ads_client, customer_id)
+      if asset["country_code"].upper() == country_code.upper()
+      and _same_number(asset["phone_number"], phone_number)
+  ]
+
+
+def _canonical_asset_resource_name(customer_id: str, value: str) -> str:
+  """Normalises a bare asset ID or a full resource name, or raises.
+
+  A resource name naming a DIFFERENT customer is refused rather than
+  silently rewritten: it means the caller is working from the wrong
+  account, and quietly repointing it at this one would be the most
+  dangerous possible interpretation.
+  """
+  raw = (value or "").strip()
+  if not raw:
+    raise ToolError("asset_resource_name was empty.")
+  if "/" in raw:
+    match = re.fullmatch(r"customers/(\d+)/assets/(\d+)", raw)
+    if not match:
+      raise ToolError(
+          f"asset_resource_name {raw!r} is not a valid asset resource "
+          "name. Expected 'customers/<customer_id>/assets/<asset_id>' or "
+          "a bare numeric asset ID."
+      )
+    if match.group(1) != str(customer_id):
+      raise ToolError(
+          f"asset_resource_name {raw!r} belongs to customer "
+          f"{match.group(1)}, but this proposal is for customer "
+          f"{customer_id}. Refusing to retarget it."
+      )
+    return raw
+  if not raw.isdigit():
+    raise ToolError(
+        f"asset_resource_name {raw!r} is neither a numeric asset ID nor a "
+        "resource name."
+    )
+  return f"customers/{customer_id}/assets/{raw}"
+
+
+def _read_call_asset_by_resource_name(
+    ads_client, customer_id: str, resource_name: str
+) -> dict[str, Any] | None:
+  """One CALL asset by exact resource name, or None.
+
+  Selected from the CALL-typed read, so a resource name that exists but
+  is some other asset type returns None and the caller refuses.
   """
   for asset in _read_call_assets(ads_client, customer_id):
-    if asset["country_code"].upper() != country_code.upper():
-      continue
-    if _same_number(asset["phone_number"], phone_number):
+    if asset["resource_name"] == resource_name:
       return asset
   return None
+
+
+def _resolve_explicit_target_asset(
+    ads_client,
+    customer_id: str,
+    asset_resource_name: str,
+    phone_number: str,
+    country_code: str,
+) -> dict[str, Any]:
+  """The one asset the caller named, validated, or raises.
+
+  Validates ownership, CALL type, and that the asset actually carries
+  the number the proposal advertises — so the human-readable block and
+  the hashed target can never describe different things.
+  """
+  canonical = _canonical_asset_resource_name(customer_id, asset_resource_name)
+  asset = _read_call_asset_by_resource_name(ads_client, customer_id, canonical)
+  if asset is None:
+    raise ToolError(
+        f"No CALL asset {canonical} exists in customer {customer_id}. "
+        "Either the asset ID is wrong, it belongs to another account, or "
+        "it is not a CALL asset. Refusing to fall back to matching by "
+        "phone number."
+    )
+  if asset["country_code"].upper() != country_code.upper():
+    raise ToolError(
+        f"CALL asset {canonical} has country_code "
+        f"{asset['country_code']!r}, but this proposal specifies "
+        f"{country_code!r}. Identical local digits under a different "
+        "country are a different number."
+    )
+  if not _same_number(asset["phone_number"], phone_number):
+    raise ToolError(
+        f"CALL asset {canonical} does not carry the number this proposal "
+        "advertises. The named target and the advertised number must "
+        "agree, or the approval block would describe one thing and the "
+        "hashed target another."
+    )
+  return asset
+
+
+def _select_asset_for_proposal(
+    ads_client,
+    customer_id: str,
+    phone_number: str,
+    country_code: str,
+    asset_resource_name: str | None,
+) -> dict[str, Any] | None:
+  """Picks the asset a proposal will target, or refuses to guess.
+
+  With an explicit target, that exact asset is used. Without one, a
+  single match is used and MORE THAN ONE IS REFUSED: returning the first
+  of several would make the approved artifact ambiguous, since the spec
+  would record a number that does not identify an asset.
+  """
+  if asset_resource_name:
+    return _resolve_explicit_target_asset(
+        ads_client,
+        customer_id,
+        asset_resource_name,
+        phone_number,
+        country_code,
+    )
+
+  matches = _find_call_assets(
+      ads_client, customer_id, phone_number, country_code
+  )
+  if not matches:
+    return None
+  if len(matches) > 1:
+    listed = "\n".join(
+        f"  - {a['resource_name']} (reporting_state="
+        f"{a['call_conversion_reporting_state']}, ad_schedule_targets="
+        f"{a['ad_schedule_targets'] or '(none)'})"
+        for a in matches
+    )
+    raise ToolError(
+        f"{len(matches)} CALL assets in customer {customer_id} carry this "
+        "number, so the number does not identify which asset to attach:\n"
+        + listed
+        + "\n\nRe-call with asset_resource_name set to the exact asset "
+        "intended. Selecting one of several on first match would record a "
+        "phone number in the approval instead of an asset, and a human "
+        "could not tell which asset they approved."
+    )
+  return matches[0]
 
 
 def _find_ad_group_call_links(
@@ -873,6 +1009,7 @@ def _prepare_attachment(
     expected_account_action: str | None,
     reuse_incompatible_asset: bool,
     reuse_existing_asset_only: bool,
+    asset_resource_name: str | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
   """Resolves and validates an attachment plan. Returns (human_lines, spec)."""
   if not _digits(phone_number):
@@ -890,8 +1027,12 @@ def _prepare_attachment(
         f"{duplicate['status']}). Nothing to propose."
     )
 
-  existing_asset = _find_call_asset(
-      ads_client, customer_id, phone_number, country_code
+  existing_asset = _select_asset_for_proposal(
+      ads_client,
+      customer_id,
+      phone_number,
+      country_code,
+      asset_resource_name,
   )
   if existing_asset is None and reuse_existing_asset_only:
     raise ToolError(
@@ -956,10 +1097,11 @@ def _prepare_attachment(
   human_lines = [f'{level.capitalize()} "{parent_label}"']
   if existing_asset:
     human_lines.append(
-        f"Reuse existing call asset {existing_asset['resource_name']} "
+        f"APPROVED TARGET ASSET: {existing_asset['resource_name']} "
         f"({existing_asset['phone_number']} / "
-        f"{existing_asset['country_code']}) — no new asset created, and "
-        "the existing asset is NOT modified."
+        f"{existing_asset['country_code']}) — reused, no new asset "
+        "created, and the existing asset is NOT modified. Apply uses "
+        "this exact asset; it never re-picks one by phone number."
     )
     human_lines.append(
         "Existing asset configuration: reporting_state="
@@ -1025,9 +1167,18 @@ def _prepare_attachment(
       ),
       "reuse_incompatible_asset": reuse_incompatible_asset,
       "reuse_existing_asset_only": reuse_existing_asset_only,
-      # Recorded for transparency. Apply re-resolves rather than trusting
-      # it, in case the account changed since approval.
+      # Kept under its historical name so older archived proposals still
+      # verify. It is no longer the only record of the target.
       "reuse_asset_resource_name": (
+          existing_asset["resource_name"] if existing_asset else None
+      ),
+      # THE APPROVED TARGET. Part of the hashed spec, so approving this
+      # proposal approves this exact asset and nothing else. Apply uses
+      # it rather than re-resolving by phone number, because a number
+      # does not identify an asset -- an account may hold several
+      # carrying the same digits. None only when no existing asset was
+      # found and the caller is permitted to create one.
+      "target_asset_resource_name": (
           existing_asset["resource_name"] if existing_asset else None
       ),
       "accepted_incompatibilities": blocking,
@@ -1062,6 +1213,7 @@ def propose_attach_call_asset_to_ad_group(
     expected_account_call_conversion_action: str | None = None,
     reuse_incompatible_asset: bool = False,
     reuse_existing_asset_only: bool = False,
+    asset_resource_name: str | None = None,
     reason_detail: str | None = None,
     client_root: str | None = None,
     client_label: str | None = None,
@@ -1100,6 +1252,14 @@ def propose_attach_call_asset_to_ad_group(
           asset with a blocking configuration difference will be reused.
       reuse_existing_asset_only: True refuses to create a new asset when
           no existing one carries the number.
+      asset_resource_name: The EXACT existing CALL asset to attach,
+          as 'customers/<customer_id>/assets/<asset_id>' or a bare
+          asset ID. Required whenever more than one CALL asset in
+          the account carries the number, because a number does not
+          identify an asset. The named asset is validated for
+          ownership, CALL type and number, recorded in the
+          hash-verified spec, and used verbatim at apply -- apply
+          never re-picks an asset by phone number.
 %s
       login_customer_id: MCC account ID if customer is managed.
   """
@@ -1126,6 +1286,7 @@ def propose_attach_call_asset_to_ad_group(
       expected_account_action=expected_account_call_conversion_action,
       reuse_incompatible_asset=reuse_incompatible_asset,
       reuse_existing_asset_only=reuse_existing_asset_only,
+      asset_resource_name=asset_resource_name,
   )
   spec["op"] = "attach_call_asset_to_ad_group"
   spec["ad_group_resource_name"] = ad_group_resource_name
@@ -1161,6 +1322,7 @@ def propose_attach_call_asset_to_campaign(
     intended_call_conversion_reporting_state: str | None = None,
     expected_account_call_conversion_action: str | None = None,
     reuse_incompatible_asset: bool = False,
+    asset_resource_name: str | None = None,
     reason_detail: str | None = None,
     client_root: str | None = None,
     client_label: str | None = None,
@@ -1194,6 +1356,14 @@ def propose_attach_call_asset_to_campaign(
           re-checked at apply.
       reuse_incompatible_asset: Required to be True before an existing
           asset with a blocking configuration difference will be reused.
+      asset_resource_name: The EXACT existing CALL asset to attach,
+          as 'customers/<customer_id>/assets/<asset_id>' or a bare
+          asset ID. Required whenever more than one CALL asset in
+          the account carries the number, because a number does not
+          identify an asset. The named asset is validated for
+          ownership, CALL type and number, recorded in the
+          hash-verified spec, and used verbatim at apply -- apply
+          never re-picks an asset by phone number.
 %s
       login_customer_id: MCC account ID if customer is managed.
   """
@@ -1220,6 +1390,7 @@ def propose_attach_call_asset_to_campaign(
       expected_account_action=expected_account_call_conversion_action,
       reuse_incompatible_asset=reuse_incompatible_asset,
       reuse_existing_asset_only=True,
+      asset_resource_name=asset_resource_name,
   )
   spec["op"] = "attach_call_asset_to_campaign"
   spec["campaign_resource_name"] = campaign_resource_name
@@ -1259,19 +1430,50 @@ def _create_call_asset(
 def _resolve_asset_for_apply(
     ads_client, customer_id: str, spec: dict[str, Any]
 ) -> tuple[str, bool]:
-  """Re-resolves the asset at apply time and re-checks reuse safety."""
+  """Re-validates the APPROVED asset at apply time and re-checks reuse.
+
+  The approved target is used, never re-selected. Re-resolving by phone
+  number was the defect this replaces: an account can hold several CALL
+  assets carrying the same digits, so apply could legitimately act on a
+  different asset than the one a human reviewed.
+  """
   phone_number = spec["phone_number"]
   country_code = spec["country_code"]
+  target = spec.get("target_asset_resource_name")
 
-  existing_asset = _find_call_asset(
-      ads_client, customer_id, phone_number, country_code
-  )
-  if existing_asset is None:
+  if target:
+    existing_asset = _read_call_asset_by_resource_name(
+        ads_client, customer_id, target
+    )
+    if existing_asset is None:
+      raise ToolError(
+          f"Refusing to apply: the approved target CALL asset {target} no "
+          "longer exists in this customer, or is no longer a CALL asset. "
+          "Re-propose against the current account state. This tool will "
+          "NOT substitute another asset carrying the same number."
+      )
+    if existing_asset["country_code"].upper() != country_code.upper():
+      raise ToolError(
+          f"Refusing to apply: approved target {target} now has "
+          f"country_code {existing_asset['country_code']!r}, not "
+          f"{country_code!r}. Re-propose."
+      )
+    if not _same_number(existing_asset["phone_number"], phone_number):
+      raise ToolError(
+          f"Refusing to apply: approved target {target} no longer carries "
+          "the number this proposal advertises. The asset was edited "
+          "after approval. Re-propose so the change is reviewed."
+      )
+  else:
     if spec.get("reuse_existing_asset_only"):
       raise ToolError(
-          "Refusing to apply: this proposal is reuse-only, but no existing "
-          f"CALL asset carries {phone_number} ({country_code}) any more."
+          "Refusing to apply: this proposal is reuse-only but records no "
+          "approved target asset. Re-propose so the exact asset is named "
+          "in the approval."
       )
+    existing_asset = None
+
+  if existing_asset is None:
     return (
         _create_call_asset(
             ads_client, customer_id, phone_number, country_code
