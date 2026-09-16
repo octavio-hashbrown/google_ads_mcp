@@ -227,16 +227,28 @@ def test_apply_refuses_a_reuse_only_spec_with_no_approved_target(account):
 
 
 def test_approved_target_is_inside_the_hashed_spec(account):
-  """Approval must cover the asset, so it has to be in what is hashed."""
+  """Approval must cover the asset, so it has to be in what is hashed.
+
+  Both specs come from the real proposal path rather than being edited
+  by hand, so this fails if _prepare_attachment ever stops recording the
+  chosen asset -- which a hand-edited comparison would not catch.
+  """
   from ads_mcp.governance import approval
 
-  spec = _prepare(asset_resource_name=INTENDED)
-  base = {"tool": "attach_call_asset_to_campaign",
-          "customer_id": CUSTOMER, "spec": dict(spec)}
-  other = {"tool": "attach_call_asset_to_campaign", "customer_id": CUSTOMER,
-           "spec": dict(spec, target_asset_resource_name=DUPLICATE)}
-  assert approval._generate_code(base) != approval._generate_code(other), (
-      "changing the approved target must change the approval code"
+  spec_intended = _prepare(asset_resource_name=INTENDED)
+  spec_duplicate = _prepare(asset_resource_name=DUPLICATE)
+  assert spec_intended["target_asset_resource_name"] == INTENDED
+  assert spec_duplicate["target_asset_resource_name"] == DUPLICATE
+
+  def code(spec):
+    return approval._generate_code({
+        "tool": "attach_call_asset_to_campaign",
+        "customer_id": CUSTOMER,
+        "spec": spec,
+    })
+
+  assert code(spec_intended) != code(spec_duplicate), (
+      "two proposals naming different assets must not share an approval code"
   )
 
 
